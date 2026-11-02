@@ -374,6 +374,7 @@ pub struct AppWindow {
     terms: HashMap<String, Term>,
     /// Mod copies by slot (block id, `<stack>#header`, or `overlay:<id>`).
     copies: HashMap<String, Copy>,
+    chats: HashMap<String, Entity<crate::chat::ChatView>>,
     overlays: Vec<Overlay>,
     folders: BTreeMap<String, Found>,
     /// Mods placed once; later the layout decides where (or whether) they show.
@@ -477,6 +478,7 @@ impl AppWindow {
             model: Model::default(),
             terms: HashMap::new(),
             copies: HashMap::new(),
+            chats: HashMap::new(),
             overlays: Vec::new(),
             folders: mods::scan().into_iter().map(|f| (f.id.clone(), f)).collect(),
             seen,
@@ -1371,6 +1373,12 @@ impl AppWindow {
     /// Creates what's visible, drops what isn't, publishes state, saves, focuses.
     fn sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.model.order_spaces();
+        let mut wanted_chats: HashMap<String, crate::chat::ChatConfig> = HashMap::new();
+        for root in std::iter::once(&self.chrome).chain(self.model.tabs().map(|tab| &tab.root)) {
+            for node in root.walk() { if let Some(Content::Chat { chat }) = node.content() { wanted_chats.insert(node.id.clone(), chat.clone()); } }
+        }
+        self.chats.retain(|id, _| wanted_chats.contains_key(id));
+        for (id, config) in wanted_chats { self.chats.entry(id).or_insert_with(|| cx.new(|cx| crate::chat::ChatView::new(config, window, cx))); }
         let (model, live) = (&self.model, &self.live);
         self.swapped.retain(|p, a| model.address_of(p).is_some() && live.contains_key(a));
         let (mut terms, mods_visible) = self.visible();
@@ -2862,6 +2870,23 @@ impl AppWindow {
                 }
             }
             // ---- panes
+            "chat.open" => {
+                let config = crate::chat::ChatConfig { id: crate::chat::fresh_id(), host: Self::owned(a, "host").unwrap_or_default(), folder: Self::owned(a, "folder").unwrap_or_default(), model: Self::owned(a, "model").unwrap_or_else(|| "opus".into()) };
+                let (space, tab, pane) = (self.model.fresh_id("s"), self.model.fresh_id("tb"), self.model.fresh_id("p"));
+                self.model.add_space(&space, "Claude Chat", &config.folder.clone(), Tab::with_pane(&tab, "Claude Chat", Node::block(pane.clone(), Content::Chat { chat: config })));
+                self.model.active = Some(space.clone());
+                self.sync(window, cx);
+                self.answer(Ok(json!({"space":space,"tab":tab,"pane":pane})));
+            }
+            "chat.status" | "chat.send" => {
+                let pane = Self::owned(a, "pane").or_else(|| self.model.focused_pane());
+                if let Some(view) = pane.as_ref().and_then(|id| self.chats.get(id)).cloned() {
+                    if name == "chat.send" {
+                        if let Some(text) = Self::owned(a, "text") { view.update(cx, |view, cx| { view.set_draft(&text, window, cx); view.send(window, cx); }); }
+                    }
+                    self.answer(Ok(view.read(cx).status(cx)));
+                } else { self.fail("Focus a native Claude Chat pane first"); }
+            }
             "pane.split" => {
                 let axis = match Self::arg(a, "direction") {
                     Some("right") => Axis::Row,
@@ -3950,6 +3975,12 @@ impl AppWindow {
                         .into_any_element()
                 }
                 None => div().into_any_element(),
+            },
+            Content::Chat { .. } => {
+                let id=n.id.clone();
+                self.chats.get(&id).map_or_else(||div().into_any_element(),|view|div().size_full().on_any_mouse_down(cx.listener(move|this,_,_,cx|{
+                    this.model.focus_pane(&id);this.focused_pane=Some(id.clone());this.synced_model_pane=this.model.focused_pane();this.publish(cx);this.save();cx.notify();
+                })).child(view.clone()).into_any_element())
             },
             Content::Mod { .. } => self.render_slot(&n.id, cx),
             Content::Agent { .. } => match self.shown_agent() {

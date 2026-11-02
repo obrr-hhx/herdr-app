@@ -2,3 +2,6 @@
 /dist
 /.brain
 /AGENTS.local.md
+
+/bridge/node_modules/
+/bridge/__pycache__/

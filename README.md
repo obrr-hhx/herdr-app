@@ -135,3 +135,13 @@ python scripts/bench.py --bin <app executable> --set spinners --seconds 20
 The runner requires `hc` on PATH and uses the Python executable running the script. It prints a unique artifact folder with the run settings, counters and results, then stops its private app, terminals and core. Both sets use Python fixture programs; the default set’s TUI workload replaces historical `btop` measurements. `--only spinners` measures just the quiet native spinner scenario. Keep the window visible and the display awake, and compare the same window activity and display settings; inactive windows may draw at a lower rate. Windows records visibility, foreground activity and display Hz at each measurement boundary; other platforms mark these observations unavailable. Visibility does not establish occlusion. Draws are window render calls. Render-to-paint elapsed time stops before scene finalization, backend drawing, uploads and presentation; it is separate from OS process CPU time. Neither measures physical presentation or the FPS HUD’s derived MAX FPS.
 
 `python scripts/bench_compare.py ghostty --root <artifact folder>` reuses a run’s fake agent for the macOS comparison. Benchmark checks: `python -m unittest discover -s scripts -p test_bench.py`.
+
+## Personal Forge chat fork
+
+This fork adds local native conversations backed by an interactive Claude CLI
+on Forge. See [the probe and backend contract](docs/forge-interactive-probe.md)
+and run `herdr-app --skill` for setup and commands.
+
+On macOS, `scripts/install-fork-macos` installs this checkout as **Herdr App**.
+It uses the standard app home and does not enable upstream binary updates.
+Open native chat from the command palette (`chat.open`) or Cmd+Shift+C on macOS.

@@ -984,3 +984,35 @@ including a small herdr-core skill you can install with the user's permission.
 - One mod per idea. Don't edit `AGENTS.md` or the `.d.ts` files (the app
   rewrites them). Don't touch other mods unless the request
   needs it.
+
+## Native Forge conversations (personal fork)
+
+`chat.status` inspects connection and history; `chat.send` queues a message.
+`chat.open` opens a conversation whose input, Markdown history and scrolling
+stay local. Claude runs as a normal interactive CLI on the selected SSH host;
+the app receives structured hooks rather than terminal frames.
+
+```sh
+herdr-app chat-install my-forge-host
+herdr-app do chat.open '{"host":"my-forge-host","folder":"/home/forge/project","model":"opus"}'
+herdr-app do chat.status --pane p12
+herdr-app do chat.send '{"pane":"p12","text":"Explain this project"}'
+```
+
+The selected folder is trusted for this chat. Remote prerequisites are Node.js,
+Python 3, and Claude Code with MessageDisplay hooks (validated with 2.1.312).
+Use the remote user's existing Claude login; do not copy credentials into the
+app. Normal user/project settings remain enabled. Connecting does not import
+a running terminal session: it creates a separate conversation.
+
+Choose **Install service**, then **Connect** in the chat header if needed.
+Enter sends; Shift+Enter inserts a newline. **Latest** returns to live output.
+Tool approvals stay pending until answered, cancelled, or expired after ten
+minutes. Closing a tab or losing SSH leaves the remote conversation running.
+The app caches history and drafts under `data/forge-chat/` in its own home.
+Use a new chat to change hosts or working folders.
+
+Text arrives by completed lines. AskUserQuestion answers are supplied through
+a PreToolUse denial reason, since the interactive CLI's question widget is
+terminal-only; the actual answer is shown to Claude without running that widget.
+Quota savings compared with headless mode have not been measured.
