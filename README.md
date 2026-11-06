@@ -8,15 +8,15 @@ information, and structured management of existing sessions. See the
 
 ## Install this fork on macOS
 
-The current implementation is available from the `handson/codex/herdr-super-agent`
-branch. It is source-built; the upstream download links below do not include
-these fork features.
+The maintained features are available on the default `master` branch.
+Install this fork from source; the upstream download links below do not include
+these additions.
 
 Install Rust 1.95.0 with rustup, Zig 0.16.0, and the Xcode command-line tools.
 Ensure `zig` is on PATH (or set `ZIG` to its executable), then run:
 
 ```sh
-git clone --recurse-submodules --branch handson/codex/herdr-super-agent https://github.com/obrr-hhx/herdr-app.git
+git clone --recurse-submodules --branch master https://github.com/obrr-hhx/herdr-app.git
 cd herdr-app
 rustup toolchain install 1.95.0
 bash scripts/install-fork-macos
@@ -24,16 +24,32 @@ bash scripts/install-fork-macos
 
 This installs `~/Applications/Herdr App.app` and `~/.local/bin/herdr-app`.
 Quit and reopen the app after installing an update; existing worker processes
-and conversation data are retained. To update this checkout, pull the same
-branch, update submodules, then rerun the installer.
+and conversation data are retained.
 
 Native chat and Super Agent additionally need Node.js, Python 3, and your own
 installed/signed-in Codex or Claude CLI. Remote Claude runs through your SSH
 hosts, with Node.js, Python 3 and the authenticated Claude CLI on the remote
 machine. Forge is optional: any suitable SSH host can be used. No personal
 accounts, API keys, session histories or machine configuration ship with this
-fork. This branch has been exercised on macOS Apple Silicon; other-platform
-support is subject to CI and runtime verification.
+fork. Native-window acceptance has been performed on macOS Apple Silicon;
+other-platform support is subject to CI and runtime verification.
+
+### Update an existing fork checkout
+
+Run these commands from your `herdr-app` checkout. If you installed from the
+original feature branch, switch to `master` once; future updates use the same
+commands.
+
+```sh
+git switch master
+git pull --ff-only origin master
+git submodule update --init --recursive
+bash scripts/install-fork-macos
+```
+
+Reopen Herdr App to load the rebuilt client. Your accounts, SSH hosts,
+conversations and decision inbox remain in your local app home; updating the
+checkout does not share them with other users.
 
 ## Upstream Herdr
 
@@ -149,15 +165,16 @@ Clone this repo with its submodules. Use Rust 1.95.0 and Zig 0.16.0, the version
 Linux needs the development packages listed in that workflow.
 
 ```sh
-git clone --recurse-submodules https://github.com/herdrdev/herdr-app.git
+git clone --recurse-submodules https://github.com/obrr-hhx/herdr-app.git
 cd herdr-app
 just build
 just test
-just install
 ```
 
 Install [just](https://github.com/casey/just) to use these recipes.
-The platform installer builds a release and adds the app to your desktop.
+On macOS, use `bash scripts/install-fork-macos` as described above. On Linux or
+Windows, run `just install`. The platform installer builds a release and adds
+the app to your desktop.
 On Linux it links to this checkout, so keep the checkout in place.
 Quit and reopen Herdr to use the new build.
 
