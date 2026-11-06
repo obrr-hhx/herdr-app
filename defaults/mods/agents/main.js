@@ -39,6 +39,14 @@ function title(tab, l) {
   const telling = live && live !== prog && !/^[~/]|^[A-Za-z]:\\/.test(live) && !live.includes("@") && live.toLowerCase() !== l?.program?.key;
   return (tab.name === prog || !tab.named) && telling ? live : tab.name;
 }
+// Native transport and execution faults are separate from requests for input.
+function nativeIssue(a) {
+  if (!a.host || a.status === "blocked") return null;
+  if (/connecting|reconnect|SSH|disconnected/i.test(a.detail ?? "")) return "Reconnecting";
+  if (a.detail === "error") return "Error";
+  if (a.detail === "interrupted") return "Stopped";
+  return null;
+}
 const RANK = { blocked: 4, done: 3, working: 2, idle: 1 };
 // A sub-agent without a pane isn't in agents(): its raw word, error counting as
 // blocked. It's never done: it reports to its parent, and the parent's done is the news.
@@ -205,6 +213,9 @@ export default class Agents extends View {
 
   // compact: a ! for blocked where a header already says "Needs you".
   status(t, a, compact = false) {
+    const issue = nativeIssue(a);
+    if (issue && compact) return div().size(14).flex_none().text_size(12).text_color(t.dim).tooltip(issue).child(issue === "Reconnecting" ? "↻" : "−");
+    if (issue) return div().flex_none().px(6).h(18).rounded(5).bg(t.input).text_size(10.5).text_color(t.dim).flex().items_center().child(issue);
     const color = t[a.status] ?? t.dim;
     if (a.status === "working") return svg("mods/workspace-chrome/spinner.svg").size(12).mx(1).flex_none().text_color(t.working).spin(900);
     if (a.status === "blocked" && compact) return div().size(14).flex_none().rounded(4).bg(t.blocked + "26").text_size(10.5).font_bold().text_color(t.blocked).flex().items_center().justify_center().child("!");
@@ -219,7 +230,8 @@ export default class Agents extends View {
     if (props()?.sortMenu) return this.sortMenu(t);
     const collapsed = narrow();
     const sort = sortOf();
-    let list = agents();
+    const manager = agents().find(a => a.super_agent);
+    let list = agents().filter(a => !a.super_agent);
     this.listed = new Map(list.map((a) => [a.address, a.status]));
     const all = terminals();
     this.migratePins(all);
@@ -286,7 +298,7 @@ export default class Agents extends View {
 
     const row = (a, i, subs = []) => {
       const pic = icon(a.program, 16, t.foreground);
-      const more = detail.get(a.address);
+      const more = detail.get(a.address)===a.space_name?null:detail.get(a.address);
       // An agent on another machine (`vps/t7`) says which.
       const machine = a.address.includes("/") ? a.address.split("/")[0] : null;
       if (collapsed) {
@@ -354,7 +366,7 @@ export default class Agents extends View {
           .when(full && Boolean(more), el => el.child(div().flex_1().min_w(0).truncate().text_color(t.dim).child(`\u00b7 ${more}`))))
         .when(Boolean(machine), el => el.child(div().text_size(10).text_color(t.dim).child(machine)))
         .when(subs.length > 0, el => el.child(fold(a, subs)))
-        .when(this.hovered === a.address, el => el.child(pin))
+        .when(this.hovered === a.address && a.pinnable !== false, el => el.child(pin))
         .when(this.hovered !== a.address && Boolean(when), el => el.child(div().flex_none().text_size(11).text_color(t.dim).child(duration(now - when))))
         .child(this.status(t, a, byPriority && !isPinned));
     };
@@ -430,6 +442,13 @@ export default class Agents extends View {
             ),
         ),
       )
+      .child(h_flex().id("super-agent").mx(collapsed ? 4 : 8).mb(6).px(9).h(38).flex_none().gap(9).items_center().rounded(8)
+        .when(Boolean(manager?.focused),el=>el.bg(t.raised))
+        .hover(el=>el.bg(t.hover)).cursor_pointer().tooltip("Super Agent · Manage local and remote sessions")
+        .on_click(()=>run("supervisor.open"))
+        .child(div().text_color(t.foreground).font_semibold().child("✦"))
+        .when(!collapsed,el=>el.child(div().flex_1().text_color(t.foreground).font_medium().child("Super Agent")))
+        .when(!collapsed && Boolean(manager),el=>el.child(this.status(t,manager,true))))
       .when(list.length === 0 && !collapsed, (el) =>
         el.child(div().px(12).text_size(12).text_color(t.dim).child("No agent status yet. Agents show up here when they report their status. Older versions and agents inside tmux may not.")),
       )

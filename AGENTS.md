@@ -1,3 +1,11 @@
+# Fork scope
+
+This is obrr-hhx/herdr-app, a personal fork of herdrdev/herdr-app. The owner
+has authorized native Forge chat development here. Upstream maintainer approval
+and release rules below apply to contributions to upstream, not this fork.
+Preserve compatibility, use isolated test homes, and never interrupt user sessions.
+Do not merge or release this fork without explicit owner authorization.
+
 # Herdr app
 
 The Herdr 2 desktop app (`herdr-app`): a native GPUI client of

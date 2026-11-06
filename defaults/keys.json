@@ -57,7 +57,8 @@
     "ctrl-shift-z": "pane.zoom",
     "ctrl-shift-l": "layout.switch",
     "f2": "tab.rename",
-    "shift-f2": "space.rename"
+    "shift-f2": "space.rename",
+    "ctrl-shift-c": "chat.open"
   },
   "terminal": {
     "ctrl-backspace": "send:\u0017",

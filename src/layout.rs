@@ -10,6 +10,8 @@ use serde_json::Value;
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Content {
+    /// Native structured conversation; it never displays remote terminal cells.
+    Chat { chat: crate::chat::ChatConfig },
     Terminal { terminal: String },
     Mod {
         #[serde(rename = "mod")]
@@ -467,7 +469,7 @@ impl Node {
 
     /// A pane in a tab: a terminal, or a mod beside them (a viewer, a board).
     pub fn is_pane(&self) -> bool {
-        matches!(self.content(), Some(Content::Terminal { .. } | Content::Mod { .. }))
+        matches!(self.content(), Some(Content::Terminal { .. } | Content::Mod { .. } | Content::Chat { .. }))
     }
 
     pub fn closable(&self) -> bool {

@@ -1,8 +1,45 @@
-# Herdr
+# Herdr App
+
+This is the maintained [obrr-hhx/herdr-app](https://github.com/obrr-hhx/herdr-app) fork.
+It includes native local/SSH Claude chats, a switchable Super Agent (Codex by
+default), a persistent decision inbox, reminders, image attachments, usage
+information, and structured management of existing sessions. See the
+[Super Agent guide](docs/super-agent.md) for behavior and limitations.
+
+## Install this fork on macOS
+
+The current implementation is available from the `handson/codex/herdr-super-agent`
+branch. It is source-built; the upstream download links below do not include
+these fork features.
+
+Install Rust 1.95.0 with rustup, Zig 0.16.0, and the Xcode command-line tools.
+Ensure `zig` is on PATH (or set `ZIG` to its executable), then run:
+
+```sh
+git clone --recurse-submodules --branch handson/codex/herdr-super-agent https://github.com/obrr-hhx/herdr-app.git
+cd herdr-app
+rustup toolchain install 1.95.0
+bash scripts/install-fork-macos
+```
+
+This installs `~/Applications/Herdr App.app` and `~/.local/bin/herdr-app`.
+Quit and reopen the app after installing an update; existing worker processes
+and conversation data are retained. To update this checkout, pull the same
+branch, update submodules, then rerun the installer.
+
+Native chat and Super Agent additionally need Node.js, Python 3, and your own
+installed/signed-in Codex or Claude CLI. Remote Claude runs through your SSH
+hosts, with Node.js, Python 3 and the authenticated Claude CLI on the remote
+machine. Forge is optional: any suitable SSH host can be used. No personal
+accounts, API keys, session histories or machine configuration ship with this
+fork. This branch has been exercised on macOS Apple Silicon; other-platform
+support is subject to CI and runtime verification.
+
+## Upstream Herdr
 
 Herdr is a desktop app for terminals and coding agents. Keep work in spaces, see which agents need you, and leave terminals running when you close the window.
 
-## Install
+## Upstream installation
 
 ### Linux and macOS
 
@@ -135,3 +172,13 @@ python scripts/bench.py --bin <app executable> --set spinners --seconds 20
 The runner requires `hc` on PATH and uses the Python executable running the script. It prints a unique artifact folder with the run settings, counters and results, then stops its private app, terminals and core. Both sets use Python fixture programs; the default set’s TUI workload replaces historical `btop` measurements. `--only spinners` measures just the quiet native spinner scenario. Keep the window visible and the display awake, and compare the same window activity and display settings; inactive windows may draw at a lower rate. Windows records visibility, foreground activity and display Hz at each measurement boundary; other platforms mark these observations unavailable. Visibility does not establish occlusion. Draws are window render calls. Render-to-paint elapsed time stops before scene finalization, backend drawing, uploads and presentation; it is separate from OS process CPU time. Neither measures physical presentation or the FPS HUD’s derived MAX FPS.
 
 `python scripts/bench_compare.py ghostty --root <artifact folder>` reuses a run’s fake agent for the macOS comparison. Benchmark checks: `python -m unittest discover -s scripts -p test_bench.py`.
+
+## Personal Forge chat fork
+
+This fork adds local native conversations backed by an interactive Claude CLI
+on Forge. See [the probe and backend contract](docs/forge-interactive-probe.md)
+and run `herdr-app --skill` for setup and commands.
+
+On macOS, `scripts/install-fork-macos` installs this checkout as **Herdr App**.
+It uses the standard app home and does not enable upstream binary updates.
+Open native chat from the command palette (`chat.open`) or Cmd+Shift+C on macOS.

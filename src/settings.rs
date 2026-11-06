@@ -373,6 +373,12 @@ pub struct Person {
     /// The herdr-core to use, when it isn't where Herdr looks (core_bin.rs).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub core: Option<String>,
+    /// Optional proxy for local native Claude/Codex services only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_chat_proxy: Option<String>,
+    /// Existing SSH host whose Claude subscription token local services may reuse in memory.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_claude_auth_host: Option<String>,
     /// Fonts for layouts that don't set their own.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub font: Option<String>,
@@ -443,6 +449,8 @@ impl Default for Person {
             zoom: 1.0,
             sounds: Sounds::default(),
             core: None,
+            local_chat_proxy: None,
+            local_claude_auth_host: None,
             font: None,
             font_size: None,
             ui_font: None,

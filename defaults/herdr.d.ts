@@ -154,6 +154,11 @@ export interface Program {
 }
 
 export interface AgentInfo {
+  /** Fixed manager, excluded from ordinary sorting. */
+  super_agent?: boolean;
+  conversation?: string;
+  completion?: number;
+  /** Terminal address, or `chat:<pane-id>` for a native Claude conversation. */
   address: string;
   pane: string;
   space: string;
@@ -167,16 +172,21 @@ export interface AgentInfo {
   /** What the agent reported (OSC 7501 `app`), e.g. "claude-code", "pi", "codex". */
   app: string | null;
   program: Program;
-  /** The terminal's title. */
+  /** The terminal title or native conversation tab name. */
   title: string;
   /** Higher = changed more recently. */
   seq: number;
   /** Pinned with `terminal.pin`, on any Herdr client. */
   pinned: boolean;
+  /** False for native chats, which do not have a core terminal to pin. */
+  pinnable?: boolean;
+  /** SSH target and connection detail for a native conversation. */
+  host?: string;
+  detail?: string;
   focused: boolean;
 }
 
-/** Terminals whose program reports a status (agents), in space, tab, pane order. Live. */
+/** Live terminal agents and native Claude conversations, in space, tab, pane order. */
 export function agents(): AgentInfo[];
 
 export interface PaneInfo {

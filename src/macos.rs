@@ -3,12 +3,18 @@ use gpui::*;
 actions!(herdr, [Quit, Hide, HideOthers, ShowAll, Settings]);
 
 pub fn init(cx: &mut App) {
+    cx.on_system_notification_response(|response,cx|{
+        if response.tag.starts_with("herdr-reminder:") {
+            cx.activate(true);
+            crate::mods::request(crate::mods::Request::Run{name:"supervisor.open".into(),args:serde_json::Value::Null});
+        }
+    });
     cx.on_action(|_: &Quit, cx| cx.quit());
     cx.on_action(|_: &Hide, cx| cx.hide());
     cx.on_action(|_: &HideOthers, cx| cx.hide_other_apps());
     cx.on_action(|_: &ShowAll, cx| cx.unhide_other_apps());
     cx.on_action(|_: &Settings, _| crate::mods::request(crate::mods::Request::Run { name: "app.settings".into(), args: serde_json::Value::Null }));
-    cx.set_menus([Menu::new("Herdr").items([
+    cx.set_menus([Menu::new("Herdr App").items([
         MenuItem::action("Settings", Settings),
         MenuItem::separator(),
         MenuItem::os_submenu("Services", SystemMenuType::Services),
