@@ -370,11 +370,17 @@ pub struct AppWindow {
     /// Bumped on every hover change, so a delayed leave knows it's still current.
     float_leave: HashMap<String, u64>,
     model: Model,
+    saved_attention: String,
+    recover_unread: bool,
+    recovered_attention: HashSet<String>,
     /// Terminal views by block id (panes and chrome terminal blocks).
     terms: HashMap<String, Term>,
     /// Mod copies by slot (block id, `<stack>#header`, or `overlay:<id>`).
     copies: HashMap<String, Copy>,
     chats: HashMap<String, Entity<crate::chat::ChatView>>,
+    chat_subscriptions: HashMap<String, Subscription>,
+    legacy_agents: HashMap<String, crate::legacy_agents::Status>,
+    agent_rows: Vec<Value>,
     overlays: Vec<Overlay>,
     folders: BTreeMap<String, Found>,
     /// Mods placed once; later the layout decides where (or whether) they show.
@@ -458,6 +464,9 @@ impl AppWindow {
         let runtime = ShellRuntime::new(cx).map_err(|e| tracing::error!("script runtime failed, mods are off: {e:#}")).ok();
         mods::note_fonts(cx);
         let seen = std::fs::read_to_string(file("seen.json")).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+        let saved_attention=std::fs::read_to_string(file("agent-attention.json")).unwrap_or_default();
+        let mut model=Model::default();
+        let recover_unread=saved_attention.is_empty() || model.restore_attention(&saved_attention).is_err();
         let mut w = AppWindow {
             core,
             runtime,
@@ -475,10 +484,16 @@ impl AppWindow {
             float_reveal: HashMap::new(),
             float_hover: HashSet::new(),
             float_leave: HashMap::new(),
-            model: Model::default(),
+            model,
+            saved_attention,
+            recover_unread,
+            recovered_attention: HashSet::new(),
             terms: HashMap::new(),
             copies: HashMap::new(),
             chats: HashMap::new(),
+            chat_subscriptions: HashMap::new(),
+            legacy_agents: HashMap::new(),
+            agent_rows: Vec::new(),
             overlays: Vec::new(),
             folders: mods::scan().into_iter().map(|f| (f.id.clone(), f)).collect(),
             seen,
@@ -521,7 +536,7 @@ impl AppWindow {
             focused_block: None,
             synced_model_pane: None,
             pane_history: Vec::new(),
-            window_active: true,
+            window_active: window.is_window_active(),
             system_dark: is_dark(window.appearance()),
             file_events: crate::files::watch(&mods::app_dir()),
             polls: 0,
@@ -578,6 +593,21 @@ impl AppWindow {
                     break;
                 }
                 cx.background_executor().timer(Duration::from_millis(400)).await;
+            }
+        }));
+        w._tasks.push(cx.spawn_in(window, async move |this, cx| {
+            loop {
+                let Ok(targets)=this.read_with(cx, |this,_| crate::legacy_agents::targets(&this.live)) else {break};
+                let requested=targets.clone();
+                let statuses=cx.background_executor().spawn(async move {crate::legacy_agents::poll(targets)}).await;
+                if this.update_in(cx, |this, window, cx| {
+                    // Targets can have exited while the read was in flight.
+                    let current=crate::legacy_agents::targets(&this.live);
+                    let statuses=statuses.into_iter().filter(|(a,_)|requested.iter().any(|(source,address)|address==a && current.get(source)==Some(address))).collect();
+                    this.legacy_agents=crate::legacy_agents::merge_statuses(statuses,&this.legacy_agents);
+                    this.tend_terminals(false,window,cx);
+                }).is_err(){break;}
+                cx.background_executor().timer(Duration::from_secs(1)).await;
             }
         }));
         if let Some(events) = w.file_events.clone() {
@@ -1317,7 +1347,7 @@ impl AppWindow {
     /// The mod listing agents chooses navigation order; model order is the fallback.
     fn agent_order(&self) -> Vec<String> {
         let m = &self.model;
-        mods::agent_order(m.all_addresses().into_iter().filter(|a| m.status(a).is_some()).collect())
+        mods::agent_order(m.all_addresses().into_iter().chain(self.chats.keys().map(|p|format!("chat:{p}"))).filter(|a| m.status(a).is_some()).collect())
     }
 
     /// The agent an agent block shows: the chosen one while it lives, else the
@@ -1350,6 +1380,9 @@ impl AppWindow {
 
     /// Makes `addr` the shown agent; a pane showing it also becomes the focused pane.
     fn focus_agent(&mut self, addr: &str) {
+        if let Some(pane)=addr.strip_prefix("chat:").filter(|p|self.chats.contains_key(*p)) {
+            self.model.focus_pane(pane);self.focused_pane=None;self.agent=None;return;
+        }
         if let Some(p) = self.model.pane_of(addr) {
             self.model.focus_pane(&p);
         }
@@ -1378,7 +1411,13 @@ impl AppWindow {
             for node in root.walk() { if let Some(Content::Chat { chat }) = node.content() { wanted_chats.insert(node.id.clone(), chat.clone()); } }
         }
         self.chats.retain(|id, _| wanted_chats.contains_key(id));
-        for (id, config) in wanted_chats { self.chats.entry(id).or_insert_with(|| cx.new(|cx| crate::chat::ChatView::new(config, window, cx))); }
+        self.chat_subscriptions.retain(|id,_|wanted_chats.contains_key(id));
+        for (id, config) in wanted_chats {
+            if self.chats.contains_key(&id){continue;}
+            let view=cx.new(|cx|crate::chat::ChatView::new(config,window,cx));let pane=id.clone();
+            let sub=cx.subscribe_in(&view,window,move|this,_,event:&crate::chat::ChatEvent,window,cx|{match event{crate::chat::ChatEvent::OpenDecisionSource{address}=>{if let Some(pane)=address.strip_prefix("chat:"){this.run("pane.focus",json!({"pane":pane}),window,cx);}else{this.run("agent.focus",json!({"terminal":address}),window,cx);}},crate::chat::ChatEvent::NewConversation{host,folder,model}=>{let space=this.model.tab_of(&pane).and_then(|t|this.model.space_of(&t.id)).map(|s|s.id.clone());this.run("chat.open",json!({"host":host,"folder":folder,"model":model,"space":space}),window,cx);}}});
+            self.chat_subscriptions.insert(id.clone(),sub);self.chats.insert(id,view);
+        }
         let (model, live) = (&self.model, &self.live);
         self.swapped.retain(|p, a| model.address_of(p).is_some() && live.contains_key(a));
         let (mut terms, mods_visible) = self.visible();
@@ -1509,7 +1548,7 @@ impl AppWindow {
         for addr in looking {
             let Some(a) = self.model.agents.get(&addr) else { continue };
             let turn = a.turn;
-            if a.word.is_none() || !self.live.contains_key(&addr) || self.looked.get(&addr) == Some(&turn) {
+            if self.legacy_agents.contains_key(&addr) || a.word.is_none() || !self.live.contains_key(&addr) || self.looked.get(&addr) == Some(&turn) {
                 continue;
             }
             self.looked.insert(addr.clone(), turn);
@@ -1619,17 +1658,28 @@ impl AppWindow {
 
     /// How a terminal shows (`program` for mods): its agent, else what it runs.
     fn program(&self, addr: &str) -> Value {
+        if let Some(agent)=self.legacy_agents.get(addr) {return crate::programs::of(Some(&agent.app),&[]);}
         let rec = self.live.get(addr).and_then(Value::as_object);
         program_of(rec.and_then(|r| r.get("report")).unwrap_or(&Value::Null), rec.and_then(running_argv))
     }
 
     /// Tells mods what changed (they re-render only if something did).
     fn publish(&mut self, cx: &mut Context<Self>) {
+        for (pane,view) in &self.chats {
+            let address=format!("chat:{pane}");
+            let looking=self.window_active && self.shows_tab() && self.model.focused_pane().as_deref()==Some(pane.as_str()) && view.read(cx).latest_visible();
+            let recover=self.recover_unread && view.read(cx).has_completed_result() && self.recovered_attention.insert(address.clone()) && !looking;
+            self.model.set_word(&address,view.read(cx).agent_word().map(str::to_owned),Some("claude-code".into()),looking);
+            self.model.observe_completion(&address,view.read(cx).completion(),looking);
+            if recover {if let Some(a)=self.model.agents.get_mut(&address){a.seen=false;}}
+            if looking {self.model.mark_seen(&[address]);}
+        }
         let m = &self.model;
         let home = home();
         let spaces: Vec<Value> = m
             .spaces
             .iter()
+            .filter(|p| !p.tabs.iter().all(|t|t.root.panes().iter().all(|n|matches!(n.content(),Some(Content::Chat{chat}) if chat.id==crate::chat::SUPER_ID))))
             .enumerate()
             .map(|(i, p)| {
                 // The branch of the terminal the space shows first.
@@ -1652,11 +1702,20 @@ impl AppWindow {
                         panes.push(json!({ "pane": p.id, "terminal": null, "mod": name, "tab": ctx.id, "title": name, "focused": focused, "zoomed": zoomed, "movable": self.pane_movable(&p.id) }));
                         continue;
                     }
+                    if let Some(Content::Chat { chat })=p.content() {
+                        let address=format!("chat:{}",p.id);
+                        let status=m.status(&address);
+                        let mut program=crate::programs::of(Some("claude-code"),&[]);
+                        if chat.id==crate::chat::SUPER_ID {program["name"]=json!("Super Agent");program["icon"]=json!("mods/agents/super.svg");program["tint"]=json!(true);}
+                        panes.push(json!({"pane":p.id,"terminal":null,"mod":"claude-chat","tab":ctx.id,"title":Model::tab_name(pr,ctx),"status":status,"app":"claude-code","program":program,"focused":focused,"zoomed":zoomed,"movable":self.pane_movable(&p.id)}));
+                        if let Some(status)=status {agents.push(json!({"address":address,"pane":p.id,"space":pr.id,"space_name":m.space_name(pr,&home),"tab":ctx.id,"tab_index":ci+1,"tab_name":Model::tab_name(pr,ctx),"status":status,"app":"claude-code","program":program,"title":Model::tab_name(pr,ctx),"seq":m.agents.get(&address).map(|a|a.seq).unwrap_or(0),"pinned":false,"pinnable":false,"focused":focused,"host":chat.host,"folder":chat.folder,"conversation":chat.id,"super_agent":chat.id==crate::chat::SUPER_ID,"completion":self.chats.get(&p.id).map(|v|v.read(cx).completion()),"attention":self.chats.get(&p.id).map(|v|v.read(cx).attention_token()),"detail":self.chats.get(&p.id).map(|v|v.read(cx).agent_detail().to_owned())}));}
+                        continue;
+                    }
                     let Some(addr) = p.terminal() else { continue };
                     let a = m.agents.get(addr);
-                    let title = self.terms.get(&p.id).map(|t| t.view.read(cx).title.clone()).or_else(|| {
+                    let title = self.legacy_agents.get(addr).map(|a|a.title.clone()).or_else(||self.terms.get(&p.id).map(|t| t.view.read(cx).title.clone()).or_else(|| {
                         self.live.get(addr).and_then(|r| r.get("title")).and_then(Value::as_str).map(str::to_owned)
-                    });
+                    }));
                     panes.push(json!({
                         "pane": p.id, "terminal": addr, "tab": ctx.id, "title": title.clone().unwrap_or_default(),
                         "cwd": self.cwds.get(addr), "branch": m.folder_info.get(addr).and_then(|f| f.branch.clone()),
@@ -1687,11 +1746,40 @@ impl AppWindow {
             Some(json!({ "space": p.id, "tab": ctx.id, "terminal": m.address_of(&pane), "shown": self.swapped.get(&pane),
                 "pane": pane, "agent": self.shown_agent(), "cwd": cwd }))
         });
-        let machines = self.documents.iter().map(|(name, slot)| json!({
+        let machines:Vec<Value> = self.documents.iter().map(|(name, slot)| json!({
             "name": (!name.is_empty()).then_some(name), "layout": slot.layout(),
         })).collect();
+        let mut managed=agents.clone();
+        for (address,record) in &self.live {
+            if managed.iter().any(|a|a["address"]==*address) || self.program(address)["agent"]!=true {continue;}
+            let pane=m.spaces.iter().flat_map(|s|s.tabs.iter()).flat_map(|t|t.root.panes()).find(|p|p.terminal()==Some(address.as_str())).map(|p|p.id.clone());
+            managed.push(json!({"address":address,"pane":pane,"title":record["title"],"status":"unavailable","detail":"Status not reported","folder":self.cwds.get(address),"program":self.program(address)}));
+        }
+        let codex_facts=crate::supervisor::codex_facts();
+        for row in &mut managed {
+            if let Some(record)=row["address"].as_str().and_then(|a|self.live.get(a)) {
+                row["read_identity"]=json!({"pid":record["pid"],"created_ms":record["created_ms"]});
+                if row["folder"].is_null(){row["folder"]=record["cwd"].clone();}
+                if let Some(source)=crate::legacy_agents::Source::from_record(record){
+                    row["read_source"]=json!({"kind":"herdr_attach","binary":source.binary,"session":source.session,"pane":source.pane});
+                }
+                if let Some(state)=record.get("status").and_then(Value::as_str) {
+                    row["execution_state"]=json!(state);
+                    row["completion"]=if matches!(state,"done"|"idle"){record["turn"].clone()}else{json!(0)};
+                }
+                if let Some(fact)=crate::supervisor::codex_fact(&codex_facts,row["address"].as_str().unwrap_or_default(),record) {
+                    row["execution_state"]=fact["execution_state"].clone();
+                    row["completion"]=fact["completion"].clone();
+                    row["attention"]=fact["attention"].clone();
+                    row["codex_thread_id"]=fact["thread_id"].clone();
+                }
+            }
+        }
+        if let Ok(closed)=crate::supervisor::archives(){managed.retain(|row|!crate::supervisor::archived(row,&closed));}
+        crate::supervisor::publish(&managed,&machines);
         let mut changed = mods::publish_machines(Value::Array(machines));
         changed |= mods::publish_spaces(Value::Array(spaces));
+        self.agent_rows=agents.clone();
         changed |= mods::publish_agents(Value::Array(agents));
         changed |= mods::publish_panes(Value::Array(panes));
         changed |= mods::publish_focused(focused.unwrap_or(Value::Null));
@@ -1699,6 +1787,10 @@ impl AppWindow {
         changed |= mods::publish_layout(&self.chrome);
         if changed {
             self.refresh_snapshot_mods(cx);
+        }
+        let attention=self.model.attention_snapshot();
+        if attention!=self.saved_attention && write_atomic(&file("agent-attention.json"),&attention) {
+            self.saved_attention=attention;
         }
         self.write_where(cx);
     }
@@ -1973,19 +2065,23 @@ impl AppWindow {
         let mut changed = self.reconcile(window, cx);
         let visible: HashSet<String> = self.visible_addresses().into_iter().collect();
         let mut alerts = Vec::new();
+        let codex_facts=crate::supervisor::codex_facts();
         for (addr, rec) in &self.live {
-            let word = rec.get("status").and_then(Value::as_str).map(str::to_owned);
-            let app = rec.get("report").and_then(|r| r.get("app")).and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_owned);
+            let word = crate::supervisor::codex_fact(&codex_facts,addr,rec).and_then(|f|f["execution_state"].as_str()).filter(|s|matches!(*s,"idle"|"working"|"blocked")).map(str::to_owned).or_else(||self.legacy_agents.get(addr).map(|s|s.word.clone())).or_else(||rec.get("status").and_then(Value::as_str).map(str::to_owned));
+            let app = self.legacy_agents.get(addr).map(|s|s.app.clone()).or_else(||rec.get("report").and_then(|r| r.get("app")).and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_owned));
             let looking = visible.contains(addr) && self.window_active;
             let prev = self.model.agents.get(addr).and_then(|a| a.word.clone());
             let child = rec.get("parent").and_then(Value::as_str).is_some_and(|p| !p.is_empty());
             if let Some(alert) = self.model.alert_for(addr, child, prev.as_deref(), word.as_deref(), looking) {
                 alerts.push((addr.clone(), alert, looking));
             }
+            let recovered_unseen=self.recover_unread && self.legacy_agents.contains_key(addr) && matches!(word.as_deref(),Some("done"|"idle")) && self.recovered_attention.insert(addr.clone());
+            let imported_unseen=(prev.is_none() && self.legacy_agents.contains_key(addr) && word.as_deref()==Some("done") || recovered_unseen) && !looking;
             changed |= self.model.set_word(addr, word, app, looking);
+            if imported_unseen {if let Some(a)=self.model.agents.get_mut(addr){a.seen=false;}}
             let turn = rec.get("turn").and_then(Value::as_u64).unwrap_or(0);
             let label = rec.pointer("/labels/herdr.seen").and_then(Value::as_str).and_then(|s| s.parse::<u64>().ok());
-            changed |= self.model.set_turn(addr, turn, label.max(self.written_seen.get(addr).copied()));
+            if self.legacy_agents.contains_key(addr) {changed |= self.model.set_turn(addr,0,None);}else{changed |= self.model.set_turn(addr, turn, label.max(self.written_seen.get(addr).copied()));}
         }
         self.written_seen.retain(|a, _| self.live.contains_key(a));
         changed |= self.share_seen(cx);
@@ -2753,6 +2849,109 @@ impl AppWindow {
     fn dispatch(&mut self, name: &str, a: &Value, person: bool, window: &mut Window, cx: &mut Context<Self>) {
         let active_ctx = self.model.active_tab().map(|c| c.id.clone());
         match name {
+            "supervisor.reminder_notify" => {
+                match crate::reminders::notification(a) {
+                    Ok(n)=>{cx.show_system_notification(n);self.answer(Ok(json!({"requested":true,"sender":"Herdr App"})));}
+                    Err(e)=>self.fail(e),
+                }
+            }
+            "supervisor.open" => {
+                let existing=self.model.spaces.iter().flat_map(|s|s.tabs.iter()).flat_map(|t|t.root.panes()).find(|p|matches!(p.content(),Some(Content::Chat{chat}) if chat.id==crate::chat::SUPER_ID)).map(|p|p.id.clone());
+                if let Some(pane)=existing { self.dispatch("pane.focus",&json!({"pane":pane}),person,window,cx);return; }
+                if let Err(e)=crate::chat::install("@local"){return self.fail(e);}
+                let folder=mods::app_dir().join("data/super-agent/workspace");
+                if let Err(e)=std::fs::create_dir_all(&folder){return self.fail(e.to_string());}
+                self.dispatch("chat.open",&json!({"host":"@local","folder":folder,"super_agent":true,"title":"Super Agent"}),person,window,cx);
+            }
+            "supervisor.list" => {
+                self.publish(cx);let mut value=crate::supervisor::read();
+                if let Some(closed)=value["closed_sessions"].as_array_mut(){for row in closed{row["pane_present"]=json!(row["session"]["pane"].as_str().is_some_and(|p|self.model.tab_of(p).is_some()));}}
+                self.answer(Ok(value));
+            }
+            "supervisor.decisions" => {
+                match crate::chat::decisions::read() { Ok(rows) => self.answer(Ok(json!({"decisions":rows}))), Err(e) => self.fail(e) }
+            }
+            "supervisor.decision" => {
+                match crate::chat::decisions::record(a) { Ok(row) => self.answer(Ok(row)), Err(e) => self.fail(e) }
+            }
+            "supervisor.close" => {
+                let address=Self::arg(a,"address").unwrap_or_default();let request=Self::arg(a,"request_id").unwrap_or_default();
+                if a["confirmed"]!=true{return self.fail("Close needs explicit user authorization: confirmed must be true");}
+                if !(8..=100).contains(&request.len()) || !request.bytes().all(|c|c.is_ascii_alphanumeric()||b"_-".contains(&c)){return self.fail("Invalid request ID");}
+                let closed=match crate::supervisor::archives(){Ok(v)=>v,Err(e)=>return self.fail(e)};
+                if let Some(old)=closed.iter().find(|c|c["request_id"]==request){
+                    if old["address"]!=address || old["identity"]!=a["expected_identity"]{return self.fail("request_id reused for a different session");}
+                    let pane=old["session"]["pane"].as_str().unwrap_or_default().to_owned();
+                    if self.model.tab_of(&pane).is_some(){
+                        let current=if address.starts_with("chat:"){
+                            self.model.tab_of(&pane).and_then(|t|t.root.find(&pane)).and_then(|n|match n.content(){Some(Content::Chat{chat})=>Some(json!({"conversation":chat.id,"host":chat.host})),_=>None})
+                        }else{self.live.get(address).map(|r|json!({"pid":r["pid"],"created_ms":r["created_ms"]}))};
+                        if current.as_ref()!=Some(&old["identity"]){return self.fail("Session identity changed; archived request cannot target a new worker");}
+                        if address.starts_with("chat:"){self.model.remove_pane(&pane);self.chats.remove(&pane);self.model.agents.remove(address);self.sync(window,cx);}
+                        else if !self.changing_terminals.contains(address){if let Err(e)=self.park_terminal(address,window,cx){return self.fail(e);}}
+                    }
+                    let present=self.model.tab_of(&pane).is_some();self.publish(cx);
+                    self.answer(Ok(json!({"address":address,"archived":true,"verified":!present,"pending":present,"history_preserved":true,"runtime_stopped":false})));return;
+                }
+                if let Some(intent)=Self::arg(a,"user_intent_id"){if crate::supervisor::latest_intent()["id"]!=intent{return self.fail("Use latest user intent from list_sessions");}}
+                self.publish(cx);
+                let snapshot=crate::supervisor::read();
+                let Some(row)=snapshot["sessions"].as_array().and_then(|rows|rows.iter().find(|r|r["address"]==address)).cloned()else{return self.fail("Unknown exact address; no session closed");};
+                if row["super_agent"]==true{return self.fail("Cannot close Super Agent");}
+                let Some(pane)=row["pane"].as_str().map(str::to_owned)else{return self.fail("Session has no attached pane; nothing closed");};
+                if !address.starts_with("chat:"){if let Err(e)=self.require_document(address.split_once('/').map(|(m,_)|m)){return self.fail(e);}}
+                let content=self.model.tab_of(&pane).and_then(|t|t.root.find(&pane)).map(|n|json!(n)).unwrap_or(Value::Null);
+                if let Err(e)=crate::supervisor::archive(&row,request,&a["expected_identity"],content){return self.fail(e);}
+                if address.starts_with("chat:") {self.model.remove_pane(&pane);self.chats.remove(&pane);self.model.agents.remove(address);self.sync(window,cx);}
+                else if let Err(e)=self.park_terminal(address,window,cx){return self.fail(e);}
+                self.publish(cx);
+                let present=self.model.tab_of(&pane).is_some();
+                self.answer(Ok(json!({"address":address,"archived":true,"verified":!present,"pending":present,"history_preserved":true,"runtime_stopped":false})));
+            }
+            "supervisor.provider" => {
+                let pane=self.model.spaces.iter().flat_map(|s|s.tabs.iter()).flat_map(|t|t.root.panes()).find(|p|matches!(p.content(),Some(Content::Chat{chat}) if chat.id==crate::chat::SUPER_ID)).map(|p|p.id.clone());
+                let Some(view)=pane.as_ref().and_then(|p|self.chats.get(p)).cloned()else{return self.fail("Open Super Agent first");};
+                let provider=Self::arg(a,"provider").unwrap_or_default();let result=view.update(cx,|v,cx|v.manager_provider(provider,cx));self.answer(result);
+            }
+            "supervisor.answer" => {
+                let intent=crate::supervisor::latest_user_event();
+                if intent["id"].as_str()!=Self::arg(a,"user_intent_id") || intent["id"].is_null(){return self.fail("Use the latest explicit user reply from list_sessions");}
+                let pane=Self::arg(a,"address").unwrap_or_default().strip_prefix("chat:").unwrap_or_default();
+                let Some(view)=self.chats.get(pane).cloned()else{return self.fail("No such native session");};
+                let id=Self::arg(a,"question_id").unwrap_or_default();
+                let result=view.update(cx,|v,cx|v.answer_question(id,&intent,cx));self.answer(result);
+            }
+            "supervisor.read" | "supervisor.send" => {
+                let address=Self::arg(a,"address").unwrap_or_default();
+                let Some(pane)=address.strip_prefix("chat:") else {return self.fail("Use the core adapter for terminal sessions");};
+                let Some(view)=self.chats.get(pane).cloned() else{return self.fail("No such native session");};
+                if name=="supervisor.read" {
+                    self.answer(Ok(view.read(cx).history(a["offset"].as_u64().unwrap_or(0) as usize,a["limit"].as_u64().unwrap_or(20) as usize)));
+                } else {
+                    let text=Self::arg(a,"text").unwrap_or_default();let id=Self::arg(a,"request_id").unwrap_or_default();
+                    if !(8..=100).contains(&id.len()) || !id.bytes().all(|b|b.is_ascii_alphanumeric()||b"_-".contains(&b)){return self.fail("Invalid request ID");}
+                    let result=view.update(cx,|v,cx|v.delegate(text,id,cx));self.answer(result);
+                }
+            }
+            "supervisor.create" => {
+                let host=Self::arg(a,"host").filter(|s|!s.is_empty()).unwrap_or("@local");
+                let folder=Self::arg(a,"folder").unwrap_or_default();
+                if !std::path::Path::new(folder).is_absolute(){return self.fail("Choose an absolute working folder");}
+                let title=Self::arg(a,"title").unwrap_or("Worker");let agent=Self::arg(a,"agent").unwrap_or("claude");
+                let before=self.model.active.clone();
+                if agent=="claude" {
+                    let known=host=="@local"||self.model.spaces.iter().flat_map(|s|s.tabs.iter()).flat_map(|t|t.root.panes()).any(|p|matches!(p.content(),Some(Content::Chat{chat}) if chat.host==host));
+                    if !known{return self.fail("Choose an existing native SSH host from list_sessions");}
+                    self.dispatch("chat.open",&json!({"host":host,"folder":folder,"title":title}),person,window,cx);
+                } else if agent=="codex" {
+                    let machine=(host!="@local").then_some(host.to_owned());
+                    if machine.as_ref().is_some_and(|m|!self.documents.contains_key(m)){return self.fail("Choose an existing core machine from list_sessions");}
+                    let result=self.new_space(title,Some(folder.to_owned()),Some(title),Some(vec!["codex".into()]),None,machine);self.answer(result);
+                    self.sync(window,cx);
+                } else {return self.fail("Supported agents: claude, codex");}
+                self.model.active=before;
+                self.sync(window,cx);
+            }
             // ---- spaces
             "space.new" => {
                 let name = Self::arg(a, "name").unwrap_or_default();
@@ -2871,9 +3070,14 @@ impl AppWindow {
             }
             // ---- panes
             "chat.open" => {
-                let config = crate::chat::ChatConfig { id: crate::chat::fresh_id(), host: Self::owned(a, "host").unwrap_or_default(), folder: Self::owned(a, "folder").unwrap_or_default(), model: Self::owned(a, "model").unwrap_or_else(|| "opus".into()) };
-                let (space, tab, pane) = (self.model.fresh_id("s"), self.model.fresh_id("tb"), self.model.fresh_id("p"));
-                self.model.add_space(&space, "Claude Chat", &config.folder.clone(), Tab::with_pane(&tab, "Claude Chat", Node::block(pane.clone(), Content::Chat { chat: config })));
+                let config = crate::chat::ChatConfig { id: if a["super_agent"]==true {crate::chat::SUPER_ID.to_owned()}else{crate::chat::fresh_id()}, host: Self::owned(a, "host").unwrap_or_default(), folder: Self::owned(a, "folder").unwrap_or_default(), model: Self::owned(a, "model").unwrap_or_else(|| "opus".into()), resume: Self::owned(a, "resume") };
+                if config.host=="@local" {if let Err(e)=crate::chat::install("@local"){return self.fail(e);}}
+                let existing_space=Self::owned(a,"space");
+                if let Some(id)=&existing_space {if self.model.space(id).is_none(){return self.fail("No such destination space");}}
+                let (space, tab, pane) = (existing_space.clone().unwrap_or_else(||self.model.fresh_id("s")), self.model.fresh_id("tb"), self.model.fresh_id("p"));
+                let title=Self::arg(a,"title").unwrap_or("Claude Chat");
+                let tab_node=Tab::with_pane(&tab,title,Node::block(pane.clone(),Content::Chat{chat:config.clone()}));
+                if existing_space.is_some(){self.model.add_tab(&space,tab_node);}else{self.model.add_space(&space,if config.id==crate::chat::SUPER_ID {"Super Agent"}else{title},&config.folder,tab_node);}
                 self.model.active = Some(space.clone());
                 self.sync(window, cx);
                 self.answer(Ok(json!({"space":space,"tab":tab,"pane":pane})));
@@ -3002,8 +3206,8 @@ impl AppWindow {
             "terminal.pin" => {
                 let Some(pinned) = a.get("pinned").and_then(Value::as_bool) else { return self.fail("terminal.pin pinned is true or false") };
                 let t = Self::arg(a, "terminal").unwrap_or_default().to_owned();
-                if !self.live.contains_key(&t) {
-                    return self.fail(format!("no running terminal {t:?}"));
+                if !self.live.contains_key(&t) && !t.strip_prefix("chat:").is_some_and(|p|self.chats.contains_key(p)) {
+                    return self.fail(format!("no running agent {t:?}"));
                 }
                 let core = self.core.clone();
                 let params = json!({ "terminal": t, "labels": { "herdr.pinned": if pinned { "1" } else { "" } } });
@@ -3073,7 +3277,7 @@ impl AppWindow {
                 if order.is_empty() {
                     return;
                 }
-                let current = self.shown_agent().map(|a| self.root_agent(&a));
+                let current = self.model.focused_pane().filter(|p|self.chats.contains_key(p)).map(|p|format!("chat:{p}")).or_else(||self.shown_agent().map(|a| self.root_agent(&a)));
                 let n = order.len();
                 let next = match current.and_then(|c| order.iter().position(|a| *a == c)) {
                     Some(i) if name == "agent.next" => (i + 1) % n,
@@ -3698,13 +3902,14 @@ impl AppWindow {
                 json!({ "id": p.id, "name": m.space_name(p, &home()), "folder": p.folder, "machine": p.machine, "active": m.active.as_deref() == Some(&p.id), "tabs": tabs })
             })
             .collect();
-        json!({ "spaces": spaces, "recent": m.recent })
+        json!({ "spaces": spaces, "recent": m.recent, "agents":self.agent_rows })
     }
 
     // ---- mods on disk ----------------------------------------------------
 
     fn poll(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.flush_documents(false, window, cx);
+        self.publish(cx);
         let ready = Self::update_label();
         if ready != self.update_ready {
             self.update_ready = ready;

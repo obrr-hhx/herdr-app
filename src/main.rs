@@ -3,6 +3,8 @@
 
 mod bench;
 mod chat;
+mod supervisor;
+mod reminders;
 mod commands;
 mod control;
 mod core_bin;
@@ -11,6 +13,7 @@ mod hc;
 mod keys;
 mod layout;
 mod layout_sync;
+mod legacy_agents;
 mod links;
 mod model;
 mod mirror;
@@ -52,6 +55,7 @@ Usage:
   herdr-app status                 what the window shows, and any errors
   herdr-app shot [file.png]        save the last window frame (default: herdr-shot.png)
   herdr-app check <mod folder>     load a mod once and report what's wrong
+  herdr-app reminder-notify <json> send a native reminder using Herdr App identity
   herdr-app chat-install <host>    install the Forge chat execution service over SSH
   herdr-app --skill                Agent Skill: driving the window, and where hc fits
   herdr-app --version
@@ -83,7 +87,13 @@ fn main() {
         attach_console();
     }
     if let [_, verb, host] = args.as_slice() {
-        if verb == "chat-install" { match chat::install(host) { Ok(()) => println!("Forge chat service installed"), Err(error) => { eprintln!("{error}"); std::process::exit(1); } } return; }
+        if verb == "chat-install" { match chat::install(host) { Ok(()) => println!("Herdr chat service installed"), Err(error) => { eprintln!("{error}"); std::process::exit(1); } } return; }
+    }
+    if let [_,verb,payload]=args.as_slice(){
+        if verb=="reminder-notify" {
+            let value=serde_json::from_str(payload).unwrap_or(serde_json::Value::Null);
+            std::process::exit(reminders::cli(value));
+        }
     }
     // `herdr-app check <mod>` / `herdr-app types <mod>`: gpui-shell's own checker, with Herdr's module installed.
     if matches!(args.get(1).map(String::as_str), Some("check" | "types")) {

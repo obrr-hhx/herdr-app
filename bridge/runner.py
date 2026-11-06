@@ -16,14 +16,39 @@ def shutdown(signum, frame):
 
 signal.signal(signal.SIGTERM, shutdown)
 signal.signal(signal.SIGINT, shutdown)
-folder, cwd, model, session = sys.argv[1:]
+folder, cwd, model, session = sys.argv[1:5]
+effort = sys.argv[5] if len(sys.argv) > 5 else ""
 root = pathlib.Path(folder)
 settings = root / 'settings.json'
 args = [os.environ.get('HERDR_CHAT_CLAUDE', 'claude'), '--model', model,
-        '--settings', str(settings), '--permission-mode', 'default', '--ax-screen-reader']
+        '--settings', str(settings), '--ax-screen-reader']
+if os.environ.get('HERDR_CHAT_LOCAL') != '1' or os.environ.get('HERDR_SUPER_AGENT') == '1':
+    args += ['--dangerously-skip-permissions']
+if os.environ.get('HERDR_SUPER_AGENT') == '1':
+    bridge = pathlib.Path(__file__).resolve().parent
+    mcp = {'mcpServers': {'herdr': {'command': 'python3', 'args': [str(bridge/'supervisor.py')]}}}
+    args += ['--append-system-prompt', (bridge/'supervisor-prompt.md').read_text(), '--tools', '', '--strict-mcp-config', '--mcp-config', json.dumps(mcp)]
+if effort:
+    args += ['--effort', effort]
 args += ['--resume', session] if (root / 'has-session').exists() else ['--session-id', session]
-if os.environ.get('HERDR_CHAT_TEST_ISOLATED') == '1':
-    args += ['--setting-sources', '', '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}', '--effort', 'low']
+if os.environ.get('HERDR_CHAT_TEST_ISOLATED') == '1' and os.environ.get('HERDR_SUPER_AGENT') != '1':
+    args += ['--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}']
+    if not effort:
+        args += ['--effort', 'low']
+# Only this local CLI receives the selected subscription credential. Never put it
+# in argv, settings files, journals or tool output.
+if os.environ.get('HERDR_CHAT_LOCAL') == '1':
+    from local_auth import subscription_environment
+    try:
+        subscription_env, subscription = subscription_environment(os.environ, os.environ.get('HERDR_LOCAL_CLAUDE_AUTH_HOST', ''))
+    except Exception:
+        print(json.dumps({'type':'authentication_failed'}), flush=True)
+        raise SystemExit(2)
+    if subscription:
+        os.environ.update(subscription_env)
+        override = json.loads(settings.read_text())
+        override['env'] = {**override.get('env', {}), **{k: subscription_env[k] for k in ['ANTHROPIC_AUTH_TOKEN','ANTHROPIC_API_KEY','ANTHROPIC_BASE_URL','CLAUDE_CODE_USE_BEDROCK','CLAUDE_CODE_USE_VERTEX','CLAUDE_CODE_USE_FOUNDRY']}}
+        args[args.index('--settings')+1] = json.dumps(override)
 pid, fd = pty.fork()
 if pid == 0:
     os.chdir(cwd)
@@ -34,6 +59,12 @@ os.set_blocking(fd, False)
 buffer = b''
 commands = b''
 trusted = False
+bypass_accepted = False
+setup_pending = True
+compacting = False
+slash_pending = False
+slash_error_seen = False
+command_started = 0.0
 
 def report(kind, **fields):
     print(json.dumps({'type': kind, **fields}), flush=True)
@@ -50,11 +81,25 @@ try:
                 break
             # Drain terminal output locally; it is never sent to the app or logged.
             buffer = (buffer + data)[-12000:]
+            if compacting and any(x in buffer.lower() for x in [b'not enough messages to compact', b'compaction failed', b'error during compaction']):
+                slash_error_seen = True
+            if slash_pending and any(x in buffer.lower() for x in [b'unknown skill', b'unknown slash command', b'unknown command', b'skill not found']):
+                slash_error_seen = True
             # Connecting a chat grants access to its selected working directory.
-            if not trusted and b'Enter y/n:' in buffer and b'trust this folder' in buffer:
+            if setup_pending and not trusted and b'Enter y/n:' in buffer and b'trust this folder' in buffer:
                 os.write(fd, b'y\r')
                 trusted = True
                 buffer = b''
+            if setup_pending and not bypass_accepted and b'Enter y/n:' in buffer and b'Yes, I accept' in buffer and b'No, exit' in buffer:
+                os.write(fd, b'y\r')
+                bypass_accepted = True
+                buffer = b''
+        if slash_error_seen and (slash_pending or compacting) and time.monotonic() - command_started > 8:
+            report('command_failed', reason='slash_unavailable' if slash_pending else 'compact_unavailable')
+            slash_pending = False
+            compacting = False
+            slash_error_seen = False
+            buffer = b''
         if sys.stdin.buffer in ready:
             chunk = os.read(sys.stdin.fileno(), 65536)
             if not chunk:
@@ -63,10 +108,23 @@ try:
             while b'\n' in commands:
                 line, commands = commands.split(b'\n', 1)
                 c = json.loads(line)
-                if c['action'] == 'interrupt':
+                if c['action'] == 'prompt_confirmed':
+                    slash_pending = False
+                    compacting = False
+                    slash_error_seen = False
+                elif c['action'] == 'interrupt':
                     os.write(fd, b'\x1b')
                 elif c['action'] == 'send':
+                    setup_pending = False
                     text = c['text']
+                    paths = c.get('image_paths', [])
+                    if paths:
+                        text += '\n\nAttached images (use Read to view these image files):\n' + '\n'.join(paths)
+                    compacting = text.strip().startswith('/compact')
+                    slash_pending = text.strip().startswith('/') and not compacting
+                    slash_error_seen = False
+                    command_started = time.monotonic()
+                    buffer = b''
                     # Never let user text escape bracketed paste or act as terminal controls.
                     if any(ord(ch) < 32 and ch not in '\n\t' for ch in text):
                         report('rejected', request_id=c['request_id'])
@@ -85,6 +143,13 @@ try:
 finally:
     try:
         os.kill(pid, signal.SIGTERM)
-        os.waitpid(pid, 0)
+        for _ in range(50):
+            if os.waitpid(pid, os.WNOHANG)[0]:
+                break
+            time.sleep(.1)
+        else:
+            os.kill(pid, signal.SIGKILL)
+            # macOS can leave an exiting CLI unreapable; never block the next backend.
+            os.waitpid(pid, os.WNOHANG)
     except ProcessLookupError:
         pass

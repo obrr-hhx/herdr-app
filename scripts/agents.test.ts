@@ -56,3 +56,20 @@ test("an unnamed tab's row reads its terminal's title, not the tab number", () =
   expect(title({ name: "fix login", named: true }, claude)).toBe("fix login");
   expect(title({ name: "3", named: false }, { ...claude, title: "claude" })).toBe("3");
 });
+
+
+test("native connection failures have a neutral badge, not a request for input", () => {
+  const issue = new Function("View", "localStorage", "props", "run", `${source}; return nativeIssue;`)(class {}, {}, () => ({}), () => {});
+  expect(issue({host:"vm",status:"idle",detail:"SSH disconnected — reconnecting"})).toBe("Reconnecting");
+  expect(issue({host:"vm",status:"working",detail:"connecting"})).toBe("Reconnecting");
+  expect(issue({host:"vm",status:"idle",detail:"error"})).toBe("Error");
+  expect(issue({host:"vm",status:"idle",detail:"interrupted"})).toBe("Stopped");
+  expect(issue({host:"vm",status:"blocked",detail:"working"})).toBeNull();
+  expect(issue({status:"blocked",detail:"error"})).toBeNull();
+});
+
+test("Super Agent stays outside ordinary sorting and above the scrollable list", () => {
+  expect(source).toContain('agents().filter(a => !a.super_agent)');
+  expect(source.indexOf('.id("super-agent")')).toBeLessThan(source.indexOf('.id("ag-list")'));
+  expect(source).toContain('run("supervisor.open")');
+});

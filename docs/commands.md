@@ -17,6 +17,109 @@ Actions use the current selection unless you give an explicit target.
 Some actions close terminals; read their descriptions before running them.
 Mods can add their own actions, which are not listed here.
 
+## `supervisor.provider`
+
+Switch the idle Super Agent between codex (default) and claude, retaining worker sessions and the task ledger.
+
+| Argument | Required |
+|---|---|
+| `provider` | yes |
+
+## `supervisor.reminder_notify`
+
+Post a Herdr-owned native reminder notification. Opens Super Agent when activated; never executes reminder text.
+
+| Argument | Required |
+|---|---|
+| `id` | yes |
+| `title` | yes |
+| `text` | yes |
+
+## `supervisor.open`
+
+Open the single Super Agent pinned above the Agents list.
+
+No arguments.
+
+## `supervisor.list`
+
+List automatically managed local and remote sessions without reading them.
+
+No arguments.
+
+## `supervisor.answer`
+
+Forward the latest user message verbatim to a pending native worker question. Does not approve tools.
+
+| Argument | Required |
+|---|---|
+| `address` | yes |
+| `question_id` | yes |
+| `user_intent_id` | yes |
+
+## `supervisor.decisions`
+
+Read the durable human decision sidebar, including answered and resolved items.
+
+No arguments.
+
+## `supervisor.decision`
+
+Upsert an observational decision card. Stable ID deduplicates; human answers and completion are preserved. Never dispatches work or grants approval.
+
+| Argument | Required |
+|---|---|
+| `id` | yes |
+| `title` | yes |
+| `context` | yes |
+| `address` | yes |
+| `options` | no |
+| `evidence` | no |
+
+## `supervisor.close`
+
+Archive one exact session from the app and management list. Preserve history/files and its underlying runtime. confirmed must be true; never closes Super Agent.
+
+| Argument | Required |
+|---|---|
+| `address` | yes |
+| `request_id` | yes |
+| `expected_identity` | yes |
+| `confirmed` | yes |
+| `user_intent_id` | no |
+
+## `supervisor.read`
+
+Read native history without changing focus or unread status.
+
+| Argument | Required |
+|---|---|
+| `address` | yes |
+| `offset` | no |
+| `limit` | no |
+
+## `supervisor.send`
+
+Queue an assignment to an idle native session without editing its draft.
+
+| Argument | Required |
+|---|---|
+| `address` | yes |
+| `text` | yes |
+| `request_id` | yes |
+
+## `supervisor.create`
+
+Create a local/remote worker without changing user focus.
+
+| Argument | Required |
+|---|---|
+| `folder` | yes |
+| `agent` | yes |
+| `title` | yes |
+| `host` | no |
+| `request_id` | yes |
+
 ## `chat.open`
 
 Open a native Claude conversation executed on an SSH machine. Input, history and scrolling stay local. Connect or install its service in the chat header.
@@ -26,6 +129,8 @@ Open a native Claude conversation executed on an SSH machine. Input, history and
 | `host` | no |
 | `folder` | no |
 | `model` | no |
+| `resume` | no |
+| `space` | no |
 
 ## `chat.status`
 

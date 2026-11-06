@@ -4,7 +4,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 [[ $(uname -s) == Darwin ]] || { echo 'macOS is required.' >&2; exit 1; }
 if [[ -z ${HERDR_APP_BINARY:-} ]]; then
-  cargo +1.95.0 build --release --locked
+  rustup run 1.95.0 cargo build --release --locked
 fi
 binary=${HERDR_APP_BINARY:-target/release/herdr-app}
 app="$HOME/Applications/Herdr App.app"

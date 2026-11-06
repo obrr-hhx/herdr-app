@@ -153,8 +153,11 @@ herdr-app do chat.send '{"pane":"p12","text":"Explain this project"}'
 The selected folder is trusted for this chat. Remote prerequisites are Node.js,
 Python 3, and Claude Code with MessageDisplay hooks (validated with 2.1.312).
 Use the remote user's existing Claude login; do not copy credentials into the
-app. Normal user/project settings remain enabled. Connecting does not import
-a running terminal session: it creates a separate conversation.
+app. Normal user/project settings remain enabled. New chats create separate conversations. To move an existing Claude conversation,
+use `chat.open` with `resume` set to its original Claude session UUID after
+exiting its idle CLI. History is imported automatically, and the remote bridge
+refuses to start a second writer while that conversation is still running.
+The host and working folder must match the original conversation.
 
 Choose **Install service**, then **Connect** in the chat header if needed.
 Enter sends; Shift+Enter inserts a newline. **Latest** returns to live output.
@@ -167,3 +170,85 @@ Text arrives by completed lines. AskUserQuestion answers are supplied through
 a PreToolUse denial reason, since the interactive CLI's question widget is
 terminal-only; the actual answer is shown to Claude without running that widget.
 Quota savings compared with headless mode have not been measured.
+
+Native Claude chats and local `herdr agent attach` clients appear in Agents
+with their live state. Chat rows use `chat:<pane-id>` addresses; click the row
+or use `pane.focus` to open the original pane. `agent.next` / `agent.prev`
+include chats. Native chat rows do not expose terminal-only pin controls.
+`herdr-app ls` includes an `agents` array matching the sidebar. A disconnected
+status source is shown as needing attention, never as a cached idle state.
+
+The native Claude composer offers `/` command completion and `@` remote file
+references. Tab or Enter accepts a completion; a file choice stays in the draft.
+Supported local commands are `/help`, `/model`, `/effort`, `/status`, `/stop`,
+and `/new` (`/clear` is an alias that keeps the original chat). `/compact` and
+discovered project/user/plugin commands execute in the interactive CLI. Native
+model and effort selectors apply to this conversation while it is idle, retaining
+its original session ID; they do not start a headless or SDK conversation.
+Connection details and a per-chat Update service action are in the header.
+Updates refuse active turns or pending approvals and preserve conversation history.
+File completion uses Git (including submodules), with bounded local caching and
+remote search for paths beyond the initial cache. It lists paths, not file contents.
+
+The native chat composer grows to six lines, then scrolls its draft locally.
+When the draft is focused, Page Up/Down and text navigation stay in the draft;
+conversation history can be scrolled with the pointer over the messages.
+
+Native remote Claude chats start and resume with full tool access
+(`--dangerously-skip-permissions`), as configured for this personal Forge fork.
+Questions asking for an actual user answer still require input. The chat header
+shows the current activity and warns after 90 seconds without progress; a live
+connection alone is not proof that Claude is making progress.
+
+Scrolling up in native chat pauses automatic following. Background status
+updates and new messages preserve the reading position; Latest, sending a new
+message, or scrolling back to the bottom resumes following.
+
+Native Claude agent attention is reserved for live questions and permission
+requests. Reconnecting, stopped, and execution errors use separate neutral badges;
+transport loss does not mark a running task as completed.
+
+Unread Done states are saved in agent-attention.json and have no expiry.
+Native chat clears Done only when the active window shows its latest result;
+reading earlier history does not acknowledge a new completion.
+
+Native Claude chats show a usage line below the composer: model, git branch,
+context percentage, five-hour and seven-day quota usage with reset countdowns,
+and estimated session cost. Details include token counts, cache reads, duration
+and changed lines. Missing metrics stay unknown. These are native Claude CLI
+status-line facts; estimated cost is not an additional Pro subscription charge.
+
+Native Claude chat supports pasting screenshots or copied PNG/JPEG/TIFF/BMP files into the editor. Click thumbnails for a full preview or × to remove a draft attachment. A message can contain up to four images (8 MB per normalized PNG, source at most 64 MB and 8192×8192). Images upload over SSH into that conversation’s private image directory before sending. Image-only messages work. Attachments persist with drafts/outbox across restarts; failed uploads keep the queued message for retry. The SSH client adapts older services without restarting their Claude process. `chat.status` includes `draft_images` and `image_preview_open` for diagnosis.
+
+Super Agent is fixed above the Agents list. `supervisor.open` opens its single persistent native local Claude chat. `supervisor.list` discovers local/remote and manually created sessions without marking them read. `supervisor.read {address,offset?,limit?}` reads native messages without changing focus; `supervisor.send {address,text,request_id}` queues to an idle native worker without touching drafts. `supervisor.create {host?,folder,agent,title,request_id}` creates a worker without selecting it (Claude: existing SSH host or `@local`; Codex: existing core machine or `@local`). Manager tool calls use durable request receipts; uncertain delivery requires inspection, not automatic resend. The manager's task ledger keeps pending reviews separate from worker idle and connectivity.
+
+`local_chat_proxy` in settings.json optionally sets a proxy for local native chat processes only; it does not change system, Git, remote SSH or core settings. The Super Agent backend selector defaults to Codex app-server, with Claude available; task ledger and worker sessions survive switching.
+
+`supervisor.answer {address,question_id,user_intent_id}` forwards the newest explicit user message verbatim to a pending native AskUserQuestion, without focusing the worker or approving its tools. The manager can use reply_to_question; it cannot authorize arbitrary tool approvals. Pending task acceptance/resumption also requires a newer explicit user intent.
+
+`supervisor.provider {provider:"codex"|"claude"}` requests a backend change while the manager is idle; its composer also offers a switch. Workers and the shared task ledger are retained.
+
+Local Claude can reuse an existing SSH host subscription via settings.json `local_claude_auth_host`; credentials remain in subprocess memory. Codex Super Agent model/effort choices come from the local app-server catalog and apply to subsequent turns.
+
+Super Agent inspection uses `inspect_sessions` to batch worker reads. `read_session` includes provenance, content age and connectivity; legacy attach clients read their original Herdr source without scrolling, and native journals remain available offline.
+
+Super Agent supports durable reminder tools (create/list/cancel/acknowledge), offset-bearing due times and once/daily/weekly recurrence. The local clock never executes reminder text. macOS background delivery requires the user to be logged in and awake; overdue reminders catch up and remain in Needs you until explicitly acknowledged.
+
+`reminder-notify <json>` sends through Herdr App's native notification identity; `supervisor.reminder_notify` is its running-window command. Notification activation opens Super Agent, without acknowledging a reminder or executing its text.
+
+Local Codex workers use their existing app-server Unix WebSocket for structured messages, tool results, runtime status, and complete pending questions. Super Agent displays question cards with full option descriptions and common command/file approvals. A human can answer those cards here, or give a newer text reply for `reply_to_question {address,question_id,user_intent_id}`. Text is forwarded verbatim to the exact pending request; approvals require explicit buttons. Source thread/process identity is revalidated before every reply. Ambiguous older TUI bindings, disconnected runtimes, secret input and unsupported approvals cannot be answered by guessing. No worker restart or terminal scrolling is involved.
+
+Super Agent uses adaptive follow-ups: after the initial idle_minutes (default 15), the manager calls plan_followup {after_minutes:1..10080|null,publish:boolean,reason} during each observation to choose its next check, or wait for the human/new evidence. It backs off when ignored and avoids repeating unchanged questions. publish=false keeps the periodic inspection silent (no chat output or banner). Decisions persist in the manager journal; new human messages or changed session evidence invalidate them. Worker tasks remain read-only; only this own follow-up clock can be changed autonomously. Existing event alerts and explicit reminders remain independent. interval_minutes is retained for compatibility and no longer sets a fixed repeat cadence.
+
+Local Codex send_message resumes the exact existing runtime thread with structured turn/start, validates live source/process identity and idle state, and returns thread/turn IDs. It preserves existing runtime settings and never types into the outer hc/Herdr attach terminal. Request receipts prevent duplicate dispatch; unknown delivery remains unknown and cannot be resent automatically. Pre-send refusals leave the request retryable with the same ID. Dispatch failure never authorizes creating a replacement worker; keep the original session and explain/repair the blocker, or obtain explicit replacement authorization.
+
+Native chat shows tools as quiet, borderless activity lines. A single tool opens its details in one click; multiple consecutive calls expand into a shared list. Shell inputs show the command while copying details retains the full request; failures remain visible on the collapsed group. Active tools show an existing description/command/path, a reduced-motion-aware pulse and elapsed wall time. Completed timings freeze; imported records without reliable timings remain unknown. No model call generates these labels. Questions/approvals use compact confirmation cards with wrapping choice buttons, selected-option explanations, optional custom answers, a full-request disclosure and an explicit one-time submit. Minimizing a card does not answer/dismiss it; drafts and Needs you remain. Duplicate submits are blocked until acknowledgment, and selecting an option never submits automatically. Tool details and long questions scroll within bounded panels; grouping changes presentation only, not saved transcript/tool IDs or history-read APIs. chat.status also reports history_rows/tool_groups/open_tool_groups/sending_decisions.
+
+Chat completion menus (model, effort, `/`, `@`) float above the composer without resizing history. Current model/effort is marked. Scrolling away from the live tail reveals a contextual “回到最新” button in the history area; selecting it resumes following. Grouped activity counts file reads, commands, edits, and searches separately. Explicit TodoWrite/update_plan steps are shown with their reported statuses; no plan or completion is inferred for other tool schemas.
+
+`supervisor.close {address, request_id, expected_identity, confirmed:true}` archives one exact app session; `expected_identity` is `{conversation,host}` for native chat or its current `read_identity` for terminal sessions. Optional `user_intent_id` must match the latest human message. The Super Agent tool `close_session` requires that intent and resolves identity itself; it must run directly rather than delegate to a sandboxed worker. A receipt with `pending:true` is unfinished; report closed only after `verified:true`. Histories, work files and the underlying execution runtime are preserved. The closed entry and original pane content are retained in `data/super-agent/closed-sessions.json`; this is not process termination. `supervisor.list` includes `closed_sessions` with `pane_present`, and closed identities are not automatically rediscovered as managed sessions. Super Agent cannot close itself.
+
+
+### Persistent decision sidebar
+`supervisor.decisions` reads the Super Agent decision inbox. `supervisor.decision {"id":"question:stable-id","title":"Choose the next step","context":"Complete question and relevant context","address":"t10","options":["A","B"],"evidence":"message-id"}` upserts an observational card without erasing the human's response/completion. No worker action is dispatched. Manager tools `list_decisions` / `record_decision` use the same canonical store. Never include credentials. Reuse the same ID for repeated observations of one question.
+The right rail preserves pending/answered decisions until the human marks them handled. An answer is explicitly submitted into the manager's durable queue, independent of the main editor draft; it does not approve worker tools or prove action completion. Open the original session from its card. Completed cards can be reopened. In narrow panes use 待你决策 to show/hide the overlay; the rail scrolls independently of chat history.

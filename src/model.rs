@@ -55,7 +55,8 @@ pub enum Alert {
 }
 
 /// What core and the user's attention say about one terminal.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Agent {
     /// The program's 7501 word (working, idle, done, blocked, error), if it reports.
     pub word: Option<String>,
@@ -72,6 +73,8 @@ pub struct Agent {
     pub seq: u64,
     /// When the state last changed, ms since the epoch (0: not since the app started).
     pub since: u64,
+    /// Last native chat completion observed, independent of connection state.
+    pub completion: u64,
 }
 
 #[derive(Default)]
@@ -432,6 +435,29 @@ impl Model {
     /// Every terminal in every tab, in space → tab → pane order.
     pub fn all_addresses(&self) -> Vec<String> {
         self.tabs().flat_map(|c| addresses(&c.root)).collect()
+    }
+
+    /// Durable attention only: no terminal contents or conversation text.
+    pub fn restore_attention(&mut self, saved: &str) -> serde_json::Result<()> {
+        let agents: HashMap<String, Agent> = serde_json::from_str(saved)?;
+        self.seq = agents.values().map(|a| a.seq).max().unwrap_or(0);
+        self.agents = agents;
+        Ok(())
+    }
+
+    pub fn attention_snapshot(&self) -> String {
+        serde_json::to_string(&self.agents.iter().collect::<BTreeMap<_,_>>()).unwrap_or_default()
+    }
+
+    pub fn observe_completion(&mut self, address: &str, completion: u64, looking: bool) -> bool {
+        let Some(a) = self.agents.get_mut(address) else { return false };
+        if completion <= a.completion { return false; }
+        a.completion = completion;
+        a.seen = looking;
+        self.seq += 1;
+        a.seq = self.seq;
+        a.since = now_ms();
+        true
     }
 
     /// Applies a status word from core (Herdr's seen rules).
@@ -833,6 +859,41 @@ mod tests {
         assert_eq!(m.status("t1"), Some("idle"));
         m.set_word("t1", Some("blocked".into()), None, true);
         assert_eq!(m.rollup(&m.all_addresses()), Some("blocked"));
+    }
+
+    #[test]
+    fn unread_done_survives_restart_status_refresh_and_long_absence() {
+        let mut m = model_with_one();
+        m.set_word("t1", Some("working".into()), Some("claude".into()), false);
+        m.set_word("t1", Some("idle".into()), None, false);
+        m.agents.get_mut("t1").unwrap().since = 1;
+        let saved = m.attention_snapshot();
+        let mut restored = model_with_one();
+        restored.restore_attention(&saved).unwrap();
+        assert_eq!(restored.status("t1"), Some("done"));
+        restored.set_word("t1", Some("idle".into()), None, false);
+        restored.set_word("t1", Some("done".into()), None, false);
+        restored.set_word("t1", Some("idle".into()), None, false);
+        assert_eq!(restored.status("t1"), Some("done"));
+        restored.mark_seen(&["t1".into()]);
+        let mut read = model_with_one();
+        read.restore_attention(&restored.attention_snapshot()).unwrap();
+        assert_eq!(read.status("t1"), Some("idle"));
+        assert!(!saved.contains("message"));
+    }
+
+    #[test]
+    fn a_completion_missed_while_closed_becomes_unread_without_a_working_transition() {
+        let mut m = model_with_one();
+        m.set_word("t1", Some("idle".into()), None, true);
+        m.observe_completion("t1", 10, true);
+        let mut restored = model_with_one();
+        restored.restore_attention(&m.attention_snapshot()).unwrap();
+        restored.set_word("t1", Some("idle".into()), None, false);
+        assert!(restored.observe_completion("t1", 20, false));
+        assert_eq!(restored.status("t1"), Some("done"));
+        assert!(!restored.observe_completion("t1", 20, false));
+        assert_eq!(restored.status("t1"), Some("done"));
     }
 
     #[test]

@@ -1,9 +1,14 @@
-//! Native conversation client. All execution stays in the remote interactive Claude service.
+//! Native editing and history, backed by local/remote execution services.
+mod attachments;
+mod composer;
+pub(crate) mod decisions;
+mod presentation;
 mod state;
+mod status_line;
 mod transport;
 mod view;
 use serde::{Deserialize, Serialize};
-pub use view::ChatView;
+pub use view::{ChatEvent, ChatView};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ChatConfig {
@@ -14,6 +19,8 @@ pub struct ChatConfig {
     pub folder: String,
     #[serde(default = "model")]
     pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume: Option<String>,
 }
 fn model() -> String {
     "opus".into()
@@ -33,3 +40,5 @@ pub fn fresh_id() -> String {
 pub fn install(host: &str) -> Result<(), String> {
     transport::install(host)
 }
+
+pub const SUPER_ID: &str = "73757065726167656e74000000000001";

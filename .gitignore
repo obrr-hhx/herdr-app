@@ -5,3 +5,5 @@
 
 /bridge/node_modules/
 /bridge/__pycache__/
+
+/scripts/__pycache__/

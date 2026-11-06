@@ -65,6 +65,19 @@ pub struct Connection {
     outbox: PathBuf,
 }
 impl Connection {
+    #[cfg(test)]
+    pub fn test_channel(outbox: PathBuf) -> (Self, mpsc::Receiver<Value>) {
+        let (tx, rx) = mpsc::channel();
+        (
+            Self {
+                tx,
+                stopped: Arc::new(AtomicBool::new(false)),
+                pending: Arc::new(Mutex::new(BTreeMap::new())),
+                outbox,
+            },
+            rx,
+        )
+    }
     pub fn send(&self, v: Value) -> bool {
         if self.stopped.load(Ordering::Acquire) {
             return false;
@@ -107,16 +120,69 @@ impl Connection {
             let outbox = worker_outbox;
             let mut cursor = cursor;
             while !stop.load(Ordering::Acquire) {
+                if config.host == "@local" {
+                    if let Err(message) = install("@local") {
+                        let _ = events.send_blocking(json!({"type":"transport","message":message}));
+                        std::thread::sleep(Duration::from_secs(1));
+                        continue;
+                    }
+                }
                 let _ = events.send_blocking(json!({"type":"transport","status":"connecting"}));
                 let script = format!(
-                    "exec node \"$HOME/.local/share/herdr-chat/client.mjs\" {} {} {}",
+                    "exec node \"$HOME/.local/share/herdr-chat/client.mjs\" {} {} {} {}",
                     quote(&config.id),
                     quote(&config.folder),
-                    quote(&config.model)
+                    quote(&config.model),
+                    quote(config.resume.as_deref().unwrap_or_default())
                 );
-                let mut command = crate::spawn::command("ssh");
-                let child = command
-                    .args([
+                let local = config.host == "@local";
+                let local_root = local.then(local_service_root);
+                let script = if let Some(root) = &local_root {
+                    format!(
+                        "export PATH=\"$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH\"; exec node {} {} {} {} {}",
+                        quote(&root.join("client.mjs").to_string_lossy()),
+                        quote(&config.id),
+                        quote(&config.folder),
+                        quote(&config.model),
+                        quote(config.resume.as_deref().unwrap_or_default())
+                    )
+                } else {
+                    script
+                };
+                let mut command = crate::spawn::command(if local { "bash" } else { "ssh" });
+                if local {
+                    command
+                        .args(["-lc", &script])
+                        .env("HERDR_CHAT_HOME", local_root.unwrap())
+                        .env("HERDR_CHAT_LOCAL", "1")
+                        .env("HERDR_APP_HOME", crate::mods::app_dir())
+                        .env("HERDR_APP_BIN", std::env::current_exe().unwrap_or_default());
+                    if let Some(host) = crate::settings::load_person()
+                        .ok()
+                        .and_then(|p| p.local_claude_auth_host)
+                    {
+                        command.env("HERDR_LOCAL_CLAUDE_AUTH_HOST", host);
+                    }
+                    if let Some(proxy) = crate::settings::load_person()
+                        .ok()
+                        .and_then(|p| p.local_chat_proxy)
+                    {
+                        let existing = std::env::var("NO_PROXY")
+                            .or_else(|_| std::env::var("no_proxy"))
+                            .unwrap_or_default();
+                        let direct = format!(
+                            "{existing},.corp.alva.xyz,.corp.stg.alva.xyz,forge.corp.stg.alva.xyz,bytebase-et.corp.alva.xyz,localhost,127.0.0.1"
+                        );
+                        command.env("NO_PROXY", &direct).env("no_proxy", &direct);
+                        for key in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
+                            command.env(key, &proxy);
+                        }
+                    }
+                    if config.id == super::SUPER_ID {
+                        command.env("HERDR_SUPER_AGENT", "1");
+                    }
+                } else {
+                    command.args([
                         "-o",
                         "BatchMode=yes",
                         "-o",
@@ -128,14 +194,16 @@ impl Connection {
                         "--",
                         &config.host,
                         &format!("bash -lc {}", quote(&script)),
-                    ])
+                    ]);
+                }
+                let child = command
                     .stdin(Stdio::piped())
                     .stdout(Stdio::piped())
                     .stderr(Stdio::null())
                     .spawn();
                 let Ok(mut child) = child else {
                     let _ = events
-                        .send_blocking(json!({"type":"transport","message":"SSH could not start"}));
+                        .send_blocking(json!({"type":"transport","message":if local {"Local chat service could not start"}else{"SSH could not start"}}));
                     break;
                 };
                 let (Some(mut input), Some(output)) = (child.stdin.take(), child.stdout.take())
@@ -170,16 +238,29 @@ impl Connection {
                         }
                     }
                 });
-                let write =
-                    |input: &mut std::process::ChildStdin, v: &Value| -> std::io::Result<()> {
-                        serde_json::to_writer(&mut *input, v)?;
-                        input.write_all(b"\n")?;
-                        input.flush()
-                    };
+                let write = |input: &mut std::process::ChildStdin,
+                             v: &Value|
+                 -> std::io::Result<()> {
+                    if v["action"] == "send"
+                        && v["images"].as_array().is_some_and(|a| !a.is_empty())
+                    {
+                        let _ = events
+                            .send_blocking(json!({"type":"upload","message":"Uploading images…"}));
+                        if let Err(message) = upload_images(&config, v) {
+                            let _ =
+                                events.send_blocking(json!({"type":"upload","message":message}));
+                            return Err(std::io::Error::other("image upload failed"));
+                        }
+                    }
+                    serde_json::to_writer(&mut *input, v)?;
+                    input.write_all(b"\n")?;
+                    input.flush()
+                };
                 let mut connected =
                     write(&mut input, &json!({"action":"subscribe","after":cursor})).is_ok();
                 if connected {
-                    for v in pending.lock().unwrap().values() {
+                    let replay: Vec<_> = pending.lock().unwrap().values().cloned().collect();
+                    for v in &replay {
                         if write(&mut input, v).is_err() {
                             connected = false;
                             break;
@@ -272,27 +353,197 @@ impl Drop for Connection {
     }
 }
 
+fn upload_images(config: &ChatConfig, command: &Value) -> Result<(), String> {
+    use base64::Engine as _;
+    let ids = command["images"]
+        .as_array()
+        .ok_or("Invalid image attachments")?;
+    if ids.len() > super::attachments::MAX_IMAGES {
+        return Err("Too many images".into());
+    }
+    let mut entries = Vec::new();
+    for id in ids {
+        let id = id
+            .as_str()
+            .filter(|s| super::attachments::valid_id(s))
+            .ok_or("Invalid image attachment")?;
+        let bytes = std::fs::read(super::attachments::path(&local_dir(&config.id), id))
+            .map_err(|_| "Image draft is missing; queued message is kept")?;
+        if bytes.len() > super::attachments::MAX_BYTES {
+            return Err("Image exceeds upload limit".into());
+        }
+        entries
+            .push(json!({"id":id,"data":base64::engine::general_purpose::STANDARD.encode(bytes)}));
+    }
+    let remote = format!(
+        "python3 \"$HOME/.local/share/herdr-chat/images.py\" {}",
+        quote(&config.id)
+    );
+    let mut command = crate::spawn::command(if config.host == "@local" {
+        "python3"
+    } else {
+        "ssh"
+    });
+    if config.host == "@local" {
+        command
+            .arg(local_service_root().join("images.py"))
+            .arg(&config.id)
+            .env("HERDR_CHAT_HOME", local_service_root());
+    } else {
+        command.args([
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=8",
+            "-o",
+            "ServerAliveInterval=10",
+            "-o",
+            "ServerAliveCountMax=3",
+            "--",
+            &config.host,
+            &remote,
+        ]);
+    }
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| "Could not start image upload")?;
+    let result = (|| -> Result<(), String> {
+        let mut input = child.stdin.take().ok_or("Image upload unavailable")?;
+        serde_json::to_writer(&mut input, &json!({"images":entries}))
+            .map_err(|_| "Image upload failed")?;
+        drop(input);
+        for _ in 0..600 {
+            if let Some(status) = child.try_wait().map_err(|_| "Image upload failed")? {
+                return if status.success() {
+                    Ok(())
+                } else {
+                    Err("Image upload failed; message is kept for retry".into())
+                };
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        Err("Image upload timed out; message is kept for retry".into())
+    })();
+    if result.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    result
+}
+
 pub fn install(host: &str) -> Result<(), String> {
     use base64::Engine as _;
     if !valid_host(host) {
         return Err("Choose a valid SSH host".into());
     }
     let files = [
+        ("checkins.py", include_str!("../../bridge/checkins.py")),
+        ("checkins.mjs", include_str!("../../bridge/checkins.mjs")),
+        ("codex_rpc.py", include_str!("../../bridge/codex_rpc.py")),
+        (
+            "codex_workers.py",
+            include_str!("../../bridge/codex_workers.py"),
+        ),
+        (
+            "codex_workers.mjs",
+            include_str!("../../bridge/codex_workers.mjs"),
+        ),
+        ("redaction.py", include_str!("../../bridge/redaction.py")),
+        (
+            "schedule_store.py",
+            include_str!("../../bridge/schedule_store.py"),
+        ),
+        ("scheduler.mjs", include_str!("../../bridge/scheduler.mjs")),
+        (
+            "session_reads.py",
+            include_str!("../../bridge/session_reads.py"),
+        ),
+        ("local_auth.py", include_str!("../../bridge/local_auth.py")),
+        ("codex.mjs", include_str!("../../bridge/codex.mjs")),
+        (
+            "supervisor.mjs",
+            include_str!("../../bridge/supervisor.mjs"),
+        ),
+        ("supervisor.py", include_str!("../../bridge/supervisor.py")),
+        (
+            "supervisor-prompt.md",
+            include_str!("../../bridge/supervisor-prompt.md"),
+        ),
         ("package.json", include_str!("../../bridge/package.json")),
         ("journal.mjs", include_str!("../../bridge/journal.mjs")),
         ("display.mjs", include_str!("../../bridge/display.mjs")),
+        ("statusline.py", include_str!("../../bridge/statusline.py")),
+        (
+            "statusline.mjs",
+            include_str!("../../bridge/statusline.mjs"),
+        ),
+        ("upgrade.py", include_str!("../../bridge/upgrade.py")),
+        ("workspace.mjs", include_str!("../../bridge/workspace.mjs")),
+        ("import.mjs", include_str!("../../bridge/import.mjs")),
         ("daemon.mjs", include_str!("../../bridge/daemon.mjs")),
         ("client.mjs", include_str!("../../bridge/client.mjs")),
         ("runner.py", include_str!("../../bridge/runner.py")),
         ("hook.py", include_str!("../../bridge/hook.py")),
+        ("images.py", include_str!("../../bridge/images.py")),
+        ("images.mjs", include_str!("../../bridge/images.mjs")),
+        (
+            "image-client.mjs",
+            include_str!("../../bridge/image-client.mjs"),
+        ),
     ];
+    if host == "@local" {
+        static LOCAL_INSTALL: Mutex<()> = Mutex::new(());
+        let _guard = LOCAL_INSTALL
+            .lock()
+            .map_err(|_| "Local install unavailable".to_owned())?;
+        let root = local_service_root();
+        std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let meta = std::fs::symlink_metadata(&root).map_err(|e| e.to_string())?;
+            if meta.file_type().is_symlink() || meta.uid() != unsafe { libc::geteuid() } {
+                return Err("Local bridge path has an unexpected owner".into());
+            }
+        }
+        let durable = crate::mods::app_dir().join("data/local-chat");
+        std::fs::create_dir_all(&durable).map_err(|e| e.to_string())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{PermissionsExt, symlink};
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
+                .map_err(|e| e.to_string())?;
+            let link = root.join("conversations");
+            if !link.exists() {
+                match symlink(&durable, &link) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(e) => return Err(e.to_string()),
+                }
+            }
+            if std::fs::read_link(&link).map_err(|e| e.to_string())? != durable {
+                return Err("Unexpected local conversation directory".into());
+            }
+        }
+        for (name, body) in files {
+            let tmp = root.join(format!("{name}.{}.new", super::fresh_id()));
+            std::fs::write(&tmp, body).map_err(|e| e.to_string())?;
+            std::fs::rename(tmp, root.join(name)).map_err(|e| e.to_string())?;
+        }
+        return Ok(());
+    }
     let mut script = String::from(
         "set -eu\nmkdir -p \"$HOME/.local/share/herdr-chat\"\nchmod 700 \"$HOME/.local/share/herdr-chat\"\ncd \"$HOME/.local/share/herdr-chat\"\n",
     );
     for (name, body) in files {
         script.push_str(&format!(
-            "printf '%s' '{}' | base64 -d > {}\n",
+            "printf '%s' '{}' | base64 -d > {}.new\nmv -f {}.new {}\n",
             base64::engine::general_purpose::STANDARD.encode(body),
+            quote(name),
+            quote(name),
             quote(name)
         ));
     }
@@ -368,4 +619,44 @@ mod tests {
         assert!(valid_host("forge@vm-1"));
         assert_eq!(quote("a'b"), "'a'\\''b'");
     }
+}
+
+/// The caller has disabled sends while updating; the remote helper rechecks idleness.
+pub fn upgrade(host: &str, id: &str) -> Result<(), String> {
+    install(host)?;
+    if id.len() < 16 || id.len() > 64 || !id.bytes().all(|c| c.is_ascii_hexdigit()) {
+        return Err("Invalid conversation identity".into());
+    }
+    let script = format!(
+        "python3 \"$HOME/.local/share/herdr-chat/upgrade.py\" {}",
+        quote(id)
+    );
+    let status = crate::spawn::command("ssh")
+        .args([
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=8",
+            "--",
+            host,
+            &format!("bash -lc {}", quote(&script)),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|_| "SSH update did not finish".to_owned())?;
+    match status.code() {
+        Some(0) => Ok(()),
+        Some(3) => Err("Finish the current turn or approval before updating this chat.".into()),
+        _ => Err("The service could not be restarted. Its conversation history is kept.".into()),
+    }
+}
+
+/// A short private path keeps Unix sockets below macOS's 104-byte limit.
+pub fn local_service_root() -> PathBuf {
+    use sha2::{Digest, Sha256};
+    let home = crate::mods::app_dir();
+    let hash = format!("{:x}", Sha256::digest(home.to_string_lossy().as_bytes()));
+    std::path::PathBuf::from("/tmp").join(format!("hchat-{}", &hash[..16]))
 }

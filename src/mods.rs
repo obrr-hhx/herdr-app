@@ -48,7 +48,15 @@ pub fn note_fonts(cx: &gpui::App) {
 
 /// The app's home: `$HERDR_APP_HOME` (tests, experiments), else
 /// `$XDG_CONFIG_HOME/herdr-app`, else `~/.config/herdr-app`, on every OS.
+#[cfg(test)]
+thread_local! {static TEST_APP_HOME:std::cell::RefCell<Option<PathBuf>>=const {std::cell::RefCell::new(None)};}
+#[cfg(test)]
+pub(crate) fn test_app_home(path:Option<PathBuf>)->Option<PathBuf>{
+    TEST_APP_HOME.with(|slot|slot.replace(path))
+}
 pub fn app_dir() -> PathBuf {
+    #[cfg(test)]
+    if let Some(path)=TEST_APP_HOME.with(|slot|slot.borrow().clone()){return path;}
     let env = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty()).map(PathBuf::from);
     env("HERDR_APP_HOME").unwrap_or_else(|| env("XDG_CONFIG_HOME").unwrap_or_else(|| home().join(".config")).join("herdr-app"))
 }

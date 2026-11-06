@@ -29,7 +29,18 @@ const fn cmd(name: &'static str, args: &'static [Arg], about: &'static str) -> C
 
 pub const COMMANDS: &[Command] = &[
     // What exists.
-    cmd("chat.open", &[opt("host"), opt("folder"), opt("model")], "Open a native Claude conversation executed on an SSH machine. Input, history and scrolling stay local. Connect or install its service in the chat header."),
+    cmd("supervisor.provider", &[req("provider")], "Switch the idle Super Agent between codex (default) and claude, retaining worker sessions and the task ledger."),
+    cmd("supervisor.reminder_notify", &[req("id"), req("title"), req("text")], "Post a Herdr-owned native reminder notification. Opens Super Agent when activated; never executes reminder text."),
+    cmd("supervisor.open", &[], "Open the single Super Agent pinned above the Agents list."),
+    cmd("supervisor.list", &[], "List automatically managed local and remote sessions without reading them."),
+    cmd("supervisor.answer", &[req("address"),req("question_id"),req("user_intent_id")], "Forward the latest user message verbatim to a pending native worker question. Does not approve tools."),
+    cmd("supervisor.decisions", &[], "Read the durable human decision sidebar, including answered and resolved items."),
+    cmd("supervisor.decision", &[req("id"),req("title"),req("context"),req("address"),opt("options"),opt("evidence")], "Upsert an observational decision card. Stable ID deduplicates; human answers and completion are preserved. Never dispatches work or grants approval."),
+    cmd("supervisor.close", &[req("address"),req("request_id"),req("expected_identity"),req("confirmed"),opt("user_intent_id")], "Archive one exact session from the app and management list. Preserve history/files and its underlying runtime. confirmed must be true; never closes Super Agent."),
+    cmd("supervisor.read", &[req("address"),opt("offset"),opt("limit")], "Read native history without changing focus or unread status."),
+    cmd("supervisor.send", &[req("address"),req("text"),req("request_id")], "Queue an assignment to an idle native session without editing its draft."),
+    cmd("supervisor.create", &[req("folder"),req("agent"),req("title"),opt("host"),req("request_id")], "Create a local/remote worker without changing user focus."),
+    cmd("chat.open", &[opt("host"), opt("folder"), opt("model"), opt("resume"), opt("space")], "Open a native Claude conversation executed on an SSH machine. Input, history and scrolling stay local. Connect or install its service in the chat header."),
     cmd("chat.status", &[opt("pane")], "Inspect a native chat's connection, history cursor and pending approvals."),
     cmd("chat.send", &[req("text"), opt("pane")], "Send a message to the focused native chat, keeping the draft if it cannot be queued."),
     cmd("space.new", &[opt("name"), opt("folder"), opt("tab"), opt("argv"), opt("task"), opt("machine")],

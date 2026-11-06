@@ -24,6 +24,13 @@ export class Journal {
     try {fs.writeSync(fd,JSON.stringify(e)+'\n');fs.fsyncSync(fd);}finally{fs.closeSync(fd);}
     this.events.push(e);return e;
   }
+  appendBatch(events){
+    const records=events.map((e,i)=>({...e,seq:this.events.length+i+1,time:Date.now()}));
+    const data=Buffer.from(records.map(e=>JSON.stringify(e)+'\n').join(''));
+    const fd=fs.openSync(this.path,'a',0o600);
+    try{for(let offset=0;offset<data.length;){offset+=fs.writeSync(fd,data,offset,data.length-offset);}fs.fsyncSync(fd);}finally{fs.closeSync(fd);}
+    for(const record of records)this.events.push(record);return records;
+  }
   accept(command) {
     const digest=crypto.createHash('sha256').update(JSON.stringify(command)).digest('hex');
     if(this.requests.has(command.request_id)) {

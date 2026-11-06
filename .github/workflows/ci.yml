@@ -134,11 +134,31 @@ jobs:
           ~/.bun/bin/bun test scripts/docs.test.ts
           ~/.bun/bin/bun scripts/docs.ts check
 
+  bridge-tests:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24.19.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: 3.14.7
+      - name: Bridge protocol and management tests
+        run: |
+          node --test bridge/*.test.mjs
+          PYTHONPATH=bridge python3 -m unittest discover -s bridge -p '*_test.py'
+      - name: Mod and documentation tests
+        run: npm exec --yes --package=bun@1.4.4 -- bun test scripts/files.test.ts scripts/picker.test.ts scripts/agents.test.ts scripts/spaces.test.ts scripts/docs.test.ts
+
   # Keep the required check name stable while requiring every platform.
   test:
-    needs: platform-tests
+    needs: [platform-tests, bridge-tests]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - run: '[ "${{ needs.platform-tests.result }}" = success ]'
+      - run: '[ "${{ needs.platform-tests.result }}" = success ] && [ "${{ needs.bridge-tests.result }}" = success ]'
