@@ -137,6 +137,7 @@ class Bridge:
             c.execute('CREATE TABLE IF NOT EXISTS answers(id TEXT PRIMARY KEY,digest TEXT NOT NULL,result TEXT)')
             c.execute('CREATE TABLE IF NOT EXISTS claims(question_id TEXT PRIMARY KEY,receipt_id TEXT NOT NULL)')
             c.execute('CREATE TABLE IF NOT EXISTS dispatches(id TEXT PRIMARY KEY,digest TEXT NOT NULL,thread_id TEXT NOT NULL,result TEXT)')
+            c.execute('CREATE TABLE IF NOT EXISTS followups(id TEXT PRIMARY KEY,payload TEXT NOT NULL,proof TEXT NOT NULL)')
         os.chmod(self.receipts,0o600)
 
     def message(self,m):
@@ -169,12 +170,15 @@ class Bridge:
 
     def publish(self):
         output={};current=now()
+        with sqlite3.connect(self.receipts) as db:
+            dispatches=[{'request_id':r[0],'thread_id':r[1],**(json.loads(r[2]) if r[2] else {'delivery':'unknown','confirmed':False})} for r in db.execute('SELECT id,thread_id,result FROM dispatches ORDER BY rowid DESC LIMIT 100')]
         with self.lock:
             for address,row in self.rows.items():
                 b=self.bound.get(address);entry={'address':address,'read_identity':identity(row),'at':current,'source':'codex_app_server','available':bool(b) or bool(self.history.get(address)),'binding_live':bool(b),'messages':self.history.get(address,[]),'connected':bool(self.client and not self.client.closed)}
                 if b:
                     t=self.threads.get(b['thread_id'],{});qs={k:{f:v for f,v in q.items() if f not in ['rpc_id','questions']} for k,q in self.pending.items() if q['thread_id']==b['thread_id']}
                     active=t.get('status',{});word='blocked' if qs or any(v in active.get('activeFlags',[]) for v in ['waitingOnApproval','waitingOnUserInput']) else 'working' if active.get('type')=='active' else 'idle' if active.get('type')=='idle' else 'unavailable'
+                    entry['dispatches']=[d for d in dispatches if d['thread_id']==b['thread_id']]
                     entry.update(thread_id=b['thread_id'],binding_method=b['method'],source_identity=b['view']['proof'],runtime_status=active,execution_state=word,pending_questions=qs,messages=self.history.get(address,[]),completion=self.completion.get(address,0),last_completed_turn=self.last_completed.get(address),title=t.get('name'))
                 else:entry.update(error=row.get('binding_error','Codex runtime binding unavailable'),execution_state='unavailable',pending_questions={})
                 output[address]=entry
@@ -210,6 +214,7 @@ class Bridge:
                 if completed and completed!=self.last_completed.get(address):self.completion[address]=self.completion.get(address,0)+1;self.last_completed[address]=completed
             except (OSError,ValueError,TimeoutError,KeyError):
                 with self.lock:self.bound.pop(address,None);row['binding_error']='Cannot uniquely bind/read the live Codex source; no answer was sent'
+        self.drain_followups()
         self.publish()
 
     def read(self,args):
@@ -235,38 +240,83 @@ class Bridge:
         # Serialize this bridge's dispatches; never type through the attached TUI.
         with self.send_lock:return self._send_message(args)
 
-    def _send_message(self,args):
+    def _send_message(self,args,draining=False):
         ident=args.get('request_id','');address=args.get('address');text=args.get('text','')
         if not re.fullmatch(r'[a-zA-Z0-9_-]{8,100}',ident):raise DispatchRefused('Invalid request_id; nothing sent')
         if not isinstance(text,str) or not text.strip() or len(text)>100000 or any(ord(ch)<32 and ch not in '\n\t' for ch in text) or redact(text)!=text:raise DispatchRefused('Invalid/credential-bearing assignment; nothing sent')
-        digest=hashlib.sha256(json.dumps({'address':address,'text':text},sort_keys=True).encode()).hexdigest()
+        mode=args.get('mode','queue')
+        if mode not in ['queue','steer']:raise DispatchRefused('Unsupported follow-up mode; nothing sent')
+        digest=hashlib.sha256(json.dumps({'address':address,'text':text,**({'mode':mode} if mode!='queue' else {})},sort_keys=True).encode()).hexdigest()
         with sqlite3.connect(self.receipts) as db:
             previous=db.execute('SELECT digest,result FROM dispatches WHERE id=?',(ident,)).fetchone()
             if previous:
                 if previous[0]!=digest:raise DispatchRefused('Request identity already belongs to a different assignment')
                 if previous[1] is None:raise ValueError('Codex dispatch delivery unknown. Inspect this SAME session; do not retry or create a replacement worker')
-                return json.loads(previous[1])
+                if not draining:return json.loads(previous[1])
         with self.lock:
             b=self.bound.get(address);row=self.rows.get(address)
             if not b or not row or not self.client or self.client.closed:raise DispatchRefused('Original Codex runtime is disconnected/unbound; nothing sent. Keep this session and repair its connection')
             if args.get('read_identity')!=identity(row):raise DispatchRefused('Source terminal identity changed; nothing sent')
-            if any(q['thread_id']==b['thread_id'] for q in self.pending.values()):raise DispatchRefused('Original Codex is awaiting a decision; answer that request instead. Nothing sent')
+            blocked=any(q['thread_id']==b['thread_id'] for q in self.pending.values())
         try:
             view=source_view(row,self.core);tid,_=bind(view,self.threads)
             if tid!=b['thread_id'] or view['proof']!=b['view']['proof']:raise DispatchRefused('Source session changed; nothing sent')
             runtime=self.client.rpc('thread/read',{'threadId':tid,'includeTurns':False})['thread']
-            if runtime.get('status',{}).get('type')!='idle':raise DispatchRefused('Original Codex is not idle; nothing sent')
+            active=runtime.get('status',{})
+            blocked=blocked or any(f in active.get('activeFlags',[]) for f in ['waitingOnApproval','waitingOnUserInput'])
+            if active.get('type') not in ['idle','active']:raise DispatchRefused('Original runtime state unavailable; nothing sent')
+            if mode=='steer' and blocked:raise DispatchRefused('Original Codex awaits a decision; steer cannot answer or approve it. Nothing sent')
+            with sqlite3.connect(self.receipts) as db:
+                earlier=db.execute('SELECT 1 FROM followups f JOIN dispatches d ON d.id=f.id WHERE f.id!=? AND d.thread_id=?',(ident,tid)).fetchone()
+            if mode=='queue' and (blocked or active.get('type')!='idle' or earlier and not draining):
+                result={'queued':True,'submitted':False,'confirmed':False,'source':'codex_app_server','address':address,'thread_id':tid,'request_id':ident,'mode':'queue','note':'Durably queued for the original session after current work and pending decisions; not started'}
+                with sqlite3.connect(self.receipts) as db:
+                    db.execute('INSERT OR IGNORE INTO dispatches VALUES (?,?,?,?)',(ident,digest,tid,json.dumps(result)))
+                    db.execute('INSERT OR IGNORE INTO followups VALUES (?,?,?)',(ident,json.dumps(args),json.dumps(b['view']['proof'],sort_keys=True)))
+                return result
+            turn=None
+            if mode=='steer' and active.get('type')=='active':
+                turns=self.client.rpc('thread/turns/list',{'threadId':tid,'limit':3,'itemsView':'notLoaded','sortDirection':'desc'})['data']
+                turn=next((t['id'] for t in turns if t.get('status')=='inProgress'),None)
+                if not turn:raise DispatchRefused('No verified active turn to steer; nothing sent')
         except (OSError,ValueError,KeyError,TimeoutError) as error:
             raise DispatchRefused(str(error)) from error
         # Persist uncertainty BEFORE writing to the runtime. A timeout or broken
         # reply must never turn into a retry with a new ID or a new worker.
-        with sqlite3.connect(self.receipts) as db:db.execute('INSERT INTO dispatches VALUES (?,?,?,NULL)',(ident,digest,tid))
-        reply=self.client.rpc('turn/start',{'threadId':tid,'input':[{'type':'text','text':text}],'clientUserMessageId':ident},timeout=12)
-        turn=reply.get('turn',{}).get('id')
+        with sqlite3.connect(self.receipts) as db:
+            db.execute('INSERT OR REPLACE INTO dispatches VALUES (?,?,?,NULL)',(ident,digest,tid))
+            db.execute('DELETE FROM followups WHERE id=?',(ident,))
+        params={'threadId':tid,'input':[{'type':'text','text':text}],'clientUserMessageId':ident}
+        if turn:params['expectedTurnId']=turn
+        reply=self.client.rpc('turn/steer' if turn else 'turn/start',params,timeout=12)
+        steered=turn is not None
+        turn=reply.get('turnId') if steered else reply.get('turn',{}).get('id')
         if not turn:raise ValueError('Codex accepted no confirmed turn ID; inspect the same session before further dispatch')
-        result={'submitted':True,'confirmed':True,'source':'codex_app_server','address':address,'thread_id':tid,'turn_id':turn,'request_id':ident,'note':'Original runtime acknowledged the input; this does not mean the task completed'}
+        result={'submitted':True,'confirmed':True,'mode':'steer' if steered else 'queue','queued':False,'source':'codex_app_server','address':address,'thread_id':tid,'turn_id':turn,'request_id':ident,'note':'Original runtime acknowledged the input; this does not mean the task completed'}
         with sqlite3.connect(self.receipts) as db:db.execute('UPDATE dispatches SET result=? WHERE id=?',(json.dumps(result),ident))
         self.publish();return result
+
+    def drain_followups(self):
+        # Queued intent is durable; uncertainty after a wire write is NOT replayed.
+        if not self.send_lock.acquire(blocking=False):return
+        try:
+            with sqlite3.connect(self.receipts) as db:
+                rows=db.execute('SELECT f.id,f.payload,f.proof,d.thread_id FROM followups f JOIN dispatches d ON d.id=f.id ORDER BY f.rowid').fetchall()
+            for ident,payload,proof,tid in rows:
+                args=json.loads(payload)
+                with self.lock:b=self.bound.get(args['address'])
+                if not b:continue  # Reconnect may restore the exact binding.
+                try:
+                    if b['thread_id']!=tid or json.dumps(b['view']['proof'],sort_keys=True)!=proof:raise DispatchRefused('Queued source identity changed; nothing sent')
+                    self._send_message(args,draining=True)
+                except DispatchRefused as e:
+                    if not any(word in str(e) for word in ['identity changed','Source session changed']):continue
+                    result={'queued':False,'submitted':False,'confirmed':False,'request_id':ident,'error':redact(str(e)),'delivery':'refused'}
+                    with sqlite3.connect(self.receipts) as db:
+                        db.execute('DELETE FROM followups WHERE id=?',(ident,))
+                        db.execute('UPDATE dispatches SET result=? WHERE id=?',(json.dumps(result),ident))
+                except Exception:pass  # NULL receipts stay unknown; never auto-resubmit.
+        finally:self.send_lock.release()
 
     def answer(self,args):
         address=args['address'];ident=args['question_id'];ui=args.get('ui',False)

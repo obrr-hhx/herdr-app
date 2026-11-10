@@ -27,6 +27,14 @@ fn installed_management_bridge_contains_its_runtime_dependencies() {
     );
     for name in [
         "supervisor.py",
+        "steering.mjs",
+        "upgrade_idle.py",
+        "goal_store.py",
+        "memory_store.py",
+        "memory_context.mjs",
+        "memory_maintenance.mjs",
+        "session_release.py",
+        "runtime_release.py",
         "scheduler.mjs",
         "schedule_store.py",
         "session_reads.py",

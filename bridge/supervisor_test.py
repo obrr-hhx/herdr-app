@@ -3,6 +3,7 @@ ROOT=tempfile.TemporaryDirectory(prefix='herdr-super-test-')
 os.environ['HERDR_APP_HOME']=ROOT.name
 os.environ['HERDR_APP_BIN']='unused-test-binary'
 spec=importlib.util.spec_from_file_location('supervisor',pathlib.Path(__file__).with_name('supervisor.py'));m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
+REAL_APP=m.app
 class Coordinator(unittest.TestCase):
  def setUp(self):
   if m.DB.exists():m.DB.unlink()
@@ -11,13 +12,44 @@ class Coordinator(unittest.TestCase):
    self.calls.append((name,args))
    return {'sessions':[{'address':'chat:p','status':'idle'}]} if name=='supervisor.list' else {'queued':True}
   m.app=app
- def test_only_human_blockers_are_automatically_captured_not_every_result(self):
-  task={'id':'task-x','title':'Choose','summary':'Full question','address':'chat:p','mandate':'Authorized work','stage':'awaiting_review'}
-  m.call('record_task',task)
-  self.assertFalse(any(n=='supervisor.decision' for n,a in self.calls))
-  m.call('record_task',{**task,'id':'task-y','stage':'waiting_user'})
-  captures=[a for n,a in self.calls if n=='supervisor.decision']
-  self.assertEqual(len(captures),1);self.assertEqual(captures[0]['context'],'Full question\n\n')
+ def test_ssh_alias_discovery_follows_includes_without_accepting_wildcards(self):
+  with tempfile.TemporaryDirectory() as directory:
+   root=pathlib.Path(directory);(root/'Parts').mkdir()
+   config=root/'config';config.write_text('Host *\n  ServerAliveInterval 10\nInclude="Parts/*.conf"\nHost "direct-alias" another-alias # comment\n')
+   (root/'Parts'/'hosts.conf').write_text('Include config\nHost=env-new\n  HostName 172.30.1.178\nHost !denied prefix-*\nHost blocked !blocked\n')
+   for host in ['env-new','direct-alias','another-alias']:self.assertTrue(m.configured_ssh_host(host,config))
+   for host in ['unconfigured','prefix-any','denied','blocked','-bad','host;command']:self.assertFalse(m.configured_ssh_host(host,config))
+ def test_first_worker_on_configured_ssh_alias_is_created_once(self):
+  from unittest.mock import patch
+  from subprocess import CompletedProcess
+  args={'agent':'claude','host':'env-new','folder':'/home/forge/project','title':'New VM worker','request_id':'first-new-vm-worker'}
+  def app(name,args=None):
+   self.calls.append((name,args));return {'sessions':[]} if name=='supervisor.list' else {'pane':'new-pane'}
+  m.app=app
+  with patch.object(m,'configured_ssh_host',return_value=True),patch.object(m.subprocess,'run',return_value=CompletedProcess([],0,'','')) as install:
+   self.assertEqual(m.call('create_session',args)['address'],'chat:new-pane')
+   self.assertEqual(m.call('create_session',args)['address'],'chat:new-pane')
+   self.assertEqual(install.call_count,1)
+  self.assertEqual(sum(n=='supervisor.create' for n,a in self.calls),1)
+ def test_unknown_host_refusal_does_not_poison_creation_request(self):
+  from unittest.mock import patch
+  from subprocess import CompletedProcess
+  args={'agent':'claude','host':'env-new','folder':'/home/forge/project','title':'New VM worker','request_id':'unknown-host-retry'}
+  with patch.object(m,'configured_ssh_host',return_value=False),patch.object(m.subprocess,'run') as install:
+   with self.assertRaisesRegex(m.Refused,'Unknown SSH host'):m.call('create_session',args)
+   install.assert_not_called()
+  c=m.db();self.assertIsNone(c.execute('SELECT id FROM sends WHERE id=?',(args['request_id'],)).fetchone());c.close()
+  with patch.object(m,'configured_ssh_host',return_value=True),patch.object(m.subprocess,'run',return_value=CompletedProcess([],0,'','')):
+   self.assertEqual(m.call('create_session',args),{'queued':True,'address':None})
+ def test_no_ledger_stage_mechanically_creates_a_human_decision(self):
+  for stage in ['working','waiting_user','awaiting_review','failed','paused']:
+   m.call('record_task',{'id':'task-'+stage,'title':'Task snapshot','summary':'Status is not a decision','address':'chat:p','mandate':'Authorized work','stage':stage})
+  self.assertFalse(any(n in ['supervisor.decision','supervisor.decision_curate'] for n,a in self.calls))
+  c=m.db();self.assertEqual(c.execute('SELECT COUNT(*) FROM tasks').fetchone()[0],5);c.close()
+ def test_curation_is_a_separate_explanatory_observation_not_worker_dispatch(self):
+  args={'action':'merge','id':'question','duplicate_ids':['old-task'],'reason':'Same actual choice and original evidence'}
+  self.assertEqual(m.call('curate_decision',args),{'queued':True});self.assertEqual(self.calls,[('supervisor.decision_curate',args)])
+  with self.assertRaises(ValueError):m.call('curate_decision',{**args,'reason':''})
  def test_old_ledger_snapshots_are_not_blindly_imported_as_new_decisions(self):
   c=m.db()
   tasks=[{'id':'active','title':'Review','summary':'Evidence','stage':'waiting_user','address':'t10','updated_at':123},{'id':'closed','title':'Old','summary':'Old','stage':'awaiting_review','address':'t4'}]
@@ -33,7 +65,8 @@ class Coordinator(unittest.TestCase):
   self.assertEqual(captures,[]);self.assertEqual(len(snapshot['tasks']),2)
  def test_decision_cards_reject_secrets_unknown_sessions_and_use_app_owned_store(self):
   m.app=lambda name,args=None: {'sessions':[{'address':'t10'}]} if name=='supervisor.list' else self.calls.append((name,args)) or {'status':'pending'}
-  a={'id':'question-1','title':'Choose','context':'Full question','address':'t10','options':['A','B']}
+  a={'id':'question-1','title':'Choose','context':'Full question','address':'t10','options':['A','B'],'decision_key':'migration-scope','reason':'The owner must choose between different scopes','source_ids':['msg_question_fixture']}
+  with self.assertRaises(ValueError):m.call('record_decision',{k:v for k,v in a.items() if k!='reason'})
   self.assertEqual(m.call('record_decision',a)['status'],'pending')
   self.assertEqual(self.calls[-1],('supervisor.decision',a))
   with self.assertRaises(ValueError):m.call('record_decision',{**a,'address':'unknown'})
@@ -81,6 +114,42 @@ class Coordinator(unittest.TestCase):
   m.app=fail
   with self.assertRaises(TimeoutError):m.call('send_message',a)
   with self.assertRaisesRegex(ValueError,'Delivery unknown'):m.call('send_message',a)
+ def test_cli_refusal_with_exit_one_keeps_reason_and_allows_same_request_retry(self):
+  from unittest.mock import patch
+  from subprocess import CompletedProcess
+  a={'address':'chat:p','text':'original authorized work','request_id':'native-refusal-01'}
+  def run(argv,**kwargs):
+   if argv[2]=='supervisor.list':return CompletedProcess(argv,0,json.dumps({'sessions':[{'address':'chat:p','status':'idle'}]}),'')
+   if not self.calls:
+    self.calls.append(argv[2]);return CompletedProcess(argv,1,json.dumps({'error':'Session is not idle; no message sent'}),'')
+   return CompletedProcess(argv,0,json.dumps({'queued':True}),'')
+  m.app=REAL_APP
+  with patch.object(m.subprocess,'run',side_effect=run):
+   with self.assertRaisesRegex(m.Refused,'Session is not idle'):m.call('send_message',a)
+   self.assertTrue(m.call('send_message',a)['queued'])
+ def test_cli_transport_and_window_timeouts_stay_unknown_and_do_not_leak(self):
+  from unittest.mock import patch
+  from subprocess import CompletedProcess
+  m.app=REAL_APP
+  for stdout in ['',json.dumps({'error':'the window did not answer'}),json.dumps({'error':'private credential must not be printed'})]:
+   with patch.object(m.subprocess,'run',return_value=CompletedProcess([],1,stdout,'private stderr')):
+    with self.assertRaises(ValueError) as caught:REAL_APP('supervisor.send',{})
+    self.assertNotIsInstance(caught.exception,m.Refused);self.assertNotIn('private',str(caught.exception))
+ def test_native_queue_and_explicit_capable_steer_preserve_modes(self):
+  m.app=lambda name,args=None:{'sessions':[{'address':'chat:p','status':'working','steer_available':True}]} if name=='supervisor.list' else self.calls.append((name,args)) or {'queued':True,'confirmed':False}
+  a={'address':'chat:p','text':'After current work','request_id':'queue-busy-native','mode':'queue'}
+  self.assertTrue(m.call('send_message',a)['queued'])
+  self.assertEqual(self.calls[0][0],'supervisor.send');self.assertNotIn('mode',self.calls[0][1])
+  self.assertTrue(m.call('send_message',{**a,'mode':'steer','request_id':'steer-native-yes'})['queued']);self.assertEqual(next(a for n,a in self.calls if n=='supervisor.send' and a.get('mode')=='steer')['mode'],'steer')
+  m.app=lambda *_:{'sessions':[{'address':'chat:p','status':'working','steer_available':False}]}
+  with self.assertRaisesRegex(m.Refused,'unavailable'):m.call('send_message',{**a,'mode':'steer','request_id':'steer-native-nope'})
+  self.assertEqual(len([n for n,a in self.calls if n=='supervisor.send']),2)
+ def test_retry_of_queued_codex_returns_updated_runtime_receipt(self):
+  from unittest.mock import patch
+  m.app=lambda *_:{'sessions':[{'address':'t4','app':'codex','read_identity':{'pid':1}}]}
+  a={'address':'t4','text':'Next work','request_id':'queue-refresh-01'}
+  with patch.object(m,'codex_control',side_effect=[{'queued':True,'confirmed':False,'source':'codex_app_server'},{'queued':False,'confirmed':True,'turn_id':'next'}]):
+   self.assertTrue(m.call('send_message',a)['queued']);self.assertTrue(m.call('send_message',a)['confirmed'])
  def test_pending_review_survives_worker_idle_and_adapter_restart(self):
   a={'id':'task','title':'work','address':'chat:p','mandate':'user asked','stage':'awaiting_review','summary':'ready'}
   m.call('record_task',a)
@@ -138,5 +207,5 @@ class Coordinator(unittest.TestCase):
   with self.assertRaises(ValueError):m.call('send_message',{'address':'chat:p','text':text,'request_id':'credential-test-01'})
  def test_mcp_only_exposes_management_tools(self):
   names=[x['name'] for x in m.handle({'method':'tools/list'})['tools']]
-  self.assertEqual(names,['plan_followup','get_checkin_settings','configure_checkins','list_sessions','inspect_sessions','read_session','send_message','close_session','create_session','reply_to_question','schedule_reminder','list_reminders','cancel_reminder','acknowledge_reminder','list_decisions','record_decision','record_task'])
+  self.assertEqual(names,['plan_followup','get_checkin_settings','configure_checkins','list_sessions','inspect_sessions','read_session','send_message','close_session','release_session','create_session','reply_to_question','schedule_reminder','list_reminders','cancel_reminder','acknowledge_reminder','list_decisions','record_decision','curate_decision','record_task','list_goals','record_goal','record_goal_progress','ask_goal_session','advance_goal','search_memories','list_memories','read_memory','review_memories','consolidate_memories','record_memory','forget_memory'])
 if __name__=='__main__':unittest.main()

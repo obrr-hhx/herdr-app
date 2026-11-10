@@ -1,6 +1,6 @@
 import test from 'node:test';import assert from 'node:assert/strict';import fs from 'node:fs';import os from 'node:os';import net from 'node:net';import path from 'node:path';import {spawn}from 'node:child_process';import {fileURLToPath}from 'node:url';import {setTimeout as delay}from 'node:timers/promises';
 test('runtime changes are refused during a turn and acknowledged after idle', {skip:process.platform==='win32'},async()=>{
- const root=fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(),'herdr-controls-')));const mock=root+'/claude';fs.writeFileSync(mock,'#!/usr/bin/env python3\nimport time\ntime.sleep(60)\n',{mode:0o755});
+ const root=fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(),'herdr-controls-')));const mock=root+'/claude';fs.writeFileSync(mock,'#!/usr/bin/env python3\nimport sys\nif "--version" in sys.argv: print("2.1.319"); sys.exit(0)\nimport time\ntime.sleep(60)\n',{mode:0o755});
  const child=spawn(process.execPath,[fileURLToPath(new URL('./daemon.mjs',import.meta.url)),root,root,'opus'],{stdio:'ignore',env:{...process.env,HERDR_CHAT_CLAUDE:mock}});let socket;
  try{
   for(let i=0;i<100&&!fs.existsSync(root+'/run.sock');i++)await delay(20);
@@ -26,7 +26,7 @@ test('new and resumed interactive runners always use the requested full tool acc
  for(const resume of [false,true]){
   const root=fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(),'herdr-permission-')));
   const mock=root+'/claude';
-  fs.writeFileSync(mock,'#!/usr/bin/env python3\nimport json,os,sys\nopen(os.environ["HERDR_QA_ARGS"],"w").write(json.dumps(sys.argv[1:]))\n',{mode:0o755});
+  fs.writeFileSync(mock,'#!/usr/bin/env python3\nimport sys\nif "--version" in sys.argv: print("2.1.319"); sys.exit(0)\nimport json,os,sys\nopen(os.environ["HERDR_QA_ARGS"],"w").write(json.dumps(sys.argv[1:]))\n',{mode:0o755});
   if(resume)fs.writeFileSync(root+'/has-session','1');
   try{
    const child=spawn('python3',[fileURLToPath(new URL('./runner.py',import.meta.url)),root,root,'opus','00000000-0000-4000-8000-000000000000','high'],{stdio:['pipe','ignore','ignore'],env:{...process.env,HERDR_CHAT_CLAUDE:mock,HERDR_QA_ARGS:root+'/args.json'}});
@@ -41,7 +41,7 @@ test('new and resumed interactive runners always use the requested full tool acc
 
 test('a queued message survives a slow idle CLI restart', {skip:process.platform==='win32',timeout:20000},async()=>{
  const root=fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(),'herdr-switch-')));const mock=root+'/claude';
- fs.writeFileSync(mock,'#!/usr/bin/env python3\nimport os,signal,time\nsignal.signal(signal.SIGTERM,signal.SIG_IGN)\nwith open(os.environ["HERDR_QA_PIDS"],"a") as f:f.write(str(os.getpid())+"\\n")\ntime.sleep(60)\n',{mode:0o700});
+ fs.writeFileSync(mock,'#!/usr/bin/env python3\nimport sys\nif "--version" in sys.argv: print("2.1.319"); sys.exit(0)\nimport os,signal,time\nsignal.signal(signal.SIGTERM,signal.SIG_IGN)\nwith open(os.environ["HERDR_QA_PIDS"],"a") as f:f.write(str(os.getpid())+"\\n")\ntime.sleep(60)\n',{mode:0o700});
  const child=spawn(process.execPath,[fileURLToPath(new URL('./daemon.mjs',import.meta.url)),root,root,'opus'],{stdio:'ignore',env:{...process.env,HERDR_CHAT_CLAUDE:mock,HERDR_QA_PIDS:root+'/pids'}});let socket;const seen=[];
  const wait=async f=>{for(let i=0;i<500;i++){const e=seen.find(f);if(e)return e;await delay(20);}throw Error('switch test timeout');};
  const hook=event=>new Promise((resolve,reject)=>{const h=net.createConnection(root+'/run.sock');h.on('error',reject);h.on('connect',()=>h.write(JSON.stringify({action:'hook',event})+'\n'));h.on('data',()=>{h.end();resolve();});});

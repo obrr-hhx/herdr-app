@@ -76,6 +76,7 @@ def local_native(home, row, offset, limit):
             f.readline()
         data = f.read()
     messages, pending, updated, malformed = {}, {}, 0, 0
+    dispatches, active_turn = {}, None
     for line in data.splitlines(keepends=True):
         if not line.endswith(b'\n'):
             continue  # A concurrent append is not a malformed source record.
@@ -85,6 +86,11 @@ def local_native(home, row, offset, limit):
             malformed += 1
             continue
         kind, key = e.get('type'), e.get('id')
+        if 'active_turn' in e:active_turn=e['active_turn']
+        if kind in ('dispatch_receipt','prompt_confirmed') and isinstance(key,str):
+            dispatches.pop(key,None);dispatches[key]={k:e[k] for k in ['id','mode','stage','reason','time'] if k in e}
+            if kind=='prompt_confirmed':dispatches[key]['stage']='confirmed'
+            if len(dispatches)>32:dispatches.pop(next(iter(dispatches)))
         if kind == 'permission':
             pending[key] = e
         elif kind == 'permission_resolved':
@@ -111,7 +117,7 @@ def local_native(home, row, offset, limit):
     end = max(0, len(rows) - offset)
     begin = max(0, end - limit)
     return {'source': 'native_journal', 'messages': rows[begin:end],
-            'pending_permissions': pending, 'content_updated_at': updated,
+            'pending_permissions': pending, 'dispatches':dispatches, 'active_turn':active_turn, 'content_updated_at': updated,
             'next_offset': offset + end - begin, 'has_more': begin > 0 or start > 0,
             'partial': start > 0 or malformed > 0, 'malformed_records_skipped': malformed}
 

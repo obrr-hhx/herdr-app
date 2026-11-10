@@ -13,6 +13,8 @@ pub struct Message {
 #[derive(Default)]
 pub struct Conversation {
     pub provider: String,
+    pub active_turn: String,
+    pub dispatches: BTreeMap<String, Value>,
     pub models: Vec<Value>,
     pub cursor: u64,
     pub completion: u64,
@@ -119,7 +121,7 @@ impl Conversation {
             }
             self.cursor = seq;
         }
-        if matches!(e["type"].as_str(), Some("activity" | "connected")) {
+        if matches!(e["type"].as_str(), Some("activity" | "connected" | "state")) {
             if let Some(time) = e["last_progress"].as_u64() {
                 self.last_progress = time;
                 self.phase = e["phase"].as_str().unwrap_or_default().into();
@@ -127,11 +129,38 @@ impl Conversation {
                 self.permission_mode = e["permission_mode"].as_str().unwrap_or_default().into();
             }
         }
+        if e.get("active_turn").is_some() {
+            self.active_turn = e["active_turn"].as_str().unwrap_or_default().into();
+        }
         let id = e["id"].as_str().unwrap_or_default().to_owned();
         match e["type"].as_str().unwrap_or_default() {
             "session" if e["resumed"] == true => self.importing_history = true,
             "import_complete" => self.importing_history = false,
-            "user" => {
+            "capabilities" => {
+                self.capabilities = e["capabilities"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|v| v.as_str().map(str::to_owned))
+                    .collect();
+            }
+            "dispatch_receipt" | "prompt_confirmed" => {
+                let receipt = if e["type"] == "prompt_confirmed" {
+                    serde_json::json!({"id":id,"mode":e["mode"],"stage":"confirmed"})
+                } else {
+                    e.clone()
+                };
+                self.dispatches.insert(id.clone(), receipt);
+                if let Some(i) = self.positions.get(&id) {
+                    self.dirty_rows.insert(*i);
+                }
+            }
+            "user" | "review_requested" => {
+                if e["mode"] == "steer" {
+                    self.dispatches.entry(id.clone()).or_insert_with(
+                        || serde_json::json!({"id":id,"mode":"steer","stage":"submitting"}),
+                    );
+                }
                 self.put(
                     id.clone(),
                     "You",
@@ -526,5 +555,19 @@ mod tests {
         assert_eq!(c.agent_word(), "idle");
         assert!(c.reminders.is_empty());
         assert_eq!(c.messages.len(), 1);
+    }
+    #[test]
+    fn steering_receipts_require_exact_confirmation_and_survive_reconnect() {
+        let mut c = Conversation::default();
+        c.apply(&json!({"type":"connected","status":"working","active_turn":"original-turn","capabilities":["steer"]}));
+        c.apply(
+            &json!({"seq":1,"type":"user","id":"steer-request","text":"change","mode":"steer"}),
+        );
+        c.apply(&json!({"seq":2,"type":"dispatch_receipt","id":"steer-request","mode":"steer","stage":"submitted"}));
+        assert_eq!(c.dispatches["steer-request"]["stage"], "submitted");
+        c.apply(&json!({"seq":3,"type":"prompt_confirmed","id":"steer-request","mode":"steer"}));
+        c.apply(&json!({"type":"connected","status":"working","active_turn":"original-turn","capabilities":["steer"]}));
+        assert_eq!(c.dispatches["steer-request"]["stage"], "confirmed");
+        assert_eq!(c.active_turn, "original-turn");
     }
 }

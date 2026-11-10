@@ -3,7 +3,7 @@ import json
 import pathlib
 import time
 
-DEFAULTS={'enabled':True,'idle_minutes':15,'interval_minutes':30,'desktop_notifications':True}
+DEFAULTS={'enabled':True,'idle_minutes':15,'interval_minutes':30,'goal_review_minutes':60,'desktop_notifications':True}
 
 def path(home):return pathlib.Path(home)/'data/super-agent/checkins.json'
 def load(home):
@@ -44,7 +44,7 @@ def describe(home):
             except ValueError:continue
             if event.get('type')=='followup_plan':latest=event;break
     except OSError:pass
-    return {'next_followup':latest,**load(home),'mode':'adaptive_followup','legacy_interval_note':'interval_minutes is retained for compatibility; adaptive scheduling does not repeat at that interval.','delivery':'While Herdr App is open, signed in and awake; missed intervals coalesce into one report. Busy turns and current human messages take priority. Uses the selected Super Agent model; each report consumes model usage. No report changes worker tasks, answers questions or approves operations.'}
+    return {'next_followup':latest,**load(home),'goal_review_note':'Unfinished goals receive a mandatory published review at goal_review_minutes, independent of silence, unchanged terminal states or an adaptive wait decision. Only stored authorized goal steps may advance.','mode':'adaptive_followup','legacy_interval_note':'interval_minutes is retained for compatibility; adaptive scheduling does not repeat at that interval.','delivery':'While Herdr App is open, signed in and awake; missed intervals coalesce into one report. Busy turns and current human messages take priority. Uses the selected Super Agent model; each report consumes model usage. Goal reviews may advance only previously stored authorized goal steps; no arbitrary worker instructions, question answers or tool approvals.'}
 
 
 def plan(home,args):

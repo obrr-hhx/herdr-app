@@ -440,6 +440,16 @@ pub fn install(host: &str) -> Result<(), String> {
         return Err("Choose a valid SSH host".into());
     }
     let files = [
+        ("goal_store.py", include_str!("../../bridge/goal_store.py")),
+        ("goal_watch.py", include_str!("../../bridge/goal_watch.py")),
+        (
+            "memory_store.py",
+            include_str!("../../bridge/memory_store.py"),
+        ),
+        (
+            "memory_context.mjs",
+            include_str!("../../bridge/memory_context.mjs"),
+        ),
         ("checkins.py", include_str!("../../bridge/checkins.py")),
         ("checkins.mjs", include_str!("../../bridge/checkins.mjs")),
         ("codex_rpc.py", include_str!("../../bridge/codex_rpc.py")),
@@ -469,6 +479,14 @@ pub fn install(host: &str) -> Result<(), String> {
         ),
         ("supervisor.py", include_str!("../../bridge/supervisor.py")),
         (
+            "session_release.py",
+            include_str!("../../bridge/session_release.py"),
+        ),
+        (
+            "runtime_release.py",
+            include_str!("../../bridge/runtime_release.py"),
+        ),
+        (
             "supervisor-prompt.md",
             include_str!("../../bridge/supervisor-prompt.md"),
         ),
@@ -484,6 +502,15 @@ pub fn install(host: &str) -> Result<(), String> {
         ("workspace.mjs", include_str!("../../bridge/workspace.mjs")),
         ("import.mjs", include_str!("../../bridge/import.mjs")),
         ("daemon.mjs", include_str!("../../bridge/daemon.mjs")),
+        ("steering.mjs", include_str!("../../bridge/steering.mjs")),
+        (
+            "memory_maintenance.mjs",
+            include_str!("../../bridge/memory_maintenance.mjs"),
+        ),
+        (
+            "upgrade_idle.py",
+            include_str!("../../bridge/upgrade_idle.py"),
+        ),
         ("client.mjs", include_str!("../../bridge/client.mjs")),
         ("runner.py", include_str!("../../bridge/runner.py")),
         ("hook.py", include_str!("../../bridge/hook.py")),
@@ -659,4 +686,119 @@ pub fn local_service_root() -> PathBuf {
     let home = crate::mods::app_dir();
     let hash = format!("{:x}", Sha256::digest(home.to_string_lossy().as_bytes()));
     std::path::PathBuf::from("/tmp").join(format!("hchat-{}", &hash[..16]))
+}
+
+/// Direct local UI edits share the manager's transactional memory store, without a model turn.
+pub fn edit_memory(home: &Path, args: &Value) -> Result<Vec<Value>, String> {
+    let runtime = home.join("data/super-agent/editor-runtime");
+    std::fs::create_dir_all(&runtime).map_err(|_| "无法打开记忆存储".to_owned())?;
+    for (name, source) in [
+        (
+            "memory_store.py",
+            include_str!("../../bridge/memory_store.py"),
+        ),
+        ("goal_store.py", include_str!("../../bridge/goal_store.py")),
+        ("goal_watch.py", include_str!("../../bridge/goal_watch.py")),
+        ("redaction.py", include_str!("../../bridge/redaction.py")),
+    ] {
+        std::fs::write(runtime.join(name), source).map_err(|_| "无法准备记忆存储".to_owned())?;
+    }
+    let mut child = std::process::Command::new("python3")
+        .arg(runtime.join("memory_store.py"))
+        .arg("--manual")
+        .arg(home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| "无法启动记忆存储，草稿已保留".to_owned())?;
+    if let Some(mut input) = child.stdin.take() {
+        serde_json::to_writer(&mut input, args)
+            .map_err(|_| "无法写入记忆，草稿已保留".to_owned())?;
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|_| "记忆存储未确认，草稿已保留".to_owned())?;
+    let value: Value = serde_json::from_slice(&output.stdout)
+        .map_err(|_| "记忆存储未确认，草稿已保留".to_owned())?;
+    if !output.status.success() {
+        return Err(value["error"]
+            .as_str()
+            .unwrap_or("保存失败，草稿已保留")
+            .to_owned());
+    }
+    value["memories"]
+        .as_array()
+        .cloned()
+        .ok_or_else(|| "记忆存储未确认，草稿已保留".into())
+}
+
+/// Delete a goal from human UI without stopping its worker or deleting evidence.
+pub fn delete_goal(home: &Path, id: &str, revision: u64) -> Result<Vec<Value>, String> {
+    let runtime = home.join("data/super-agent/goal-editor-runtime");
+    std::fs::create_dir_all(&runtime).map_err(|e| e.to_string())?;
+    for (name, source) in [
+        ("goal_store.py", include_str!("../../bridge/goal_store.py")),
+        ("redaction.py", include_str!("../../bridge/redaction.py")),
+    ] {
+        std::fs::write(runtime.join(name), source).map_err(|e| e.to_string())?;
+    }
+    let mut child = std::process::Command::new("python3")
+        .arg(runtime.join("goal_store.py"))
+        .arg("--delete-manual")
+        .arg(home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    serde_json::to_writer(
+        child.stdin.take().unwrap(),
+        &json!({"id":id,"expected_revision":revision}),
+    )
+    .map_err(|e| e.to_string())?;
+    let output = child.wait_with_output().map_err(|e| e.to_string())?;
+    let value: Value = serde_json::from_slice(&output.stdout).map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        return Err(value["error"].as_str().unwrap_or("删除失败").to_owned());
+    }
+    value["goals"]
+        .as_array()
+        .cloned()
+        .ok_or_else(|| "目标列表未确认".to_owned())
+}
+
+#[cfg(test)]
+mod memory_editor_tests {
+    use super::*;
+    #[test]
+    fn local_memory_editor_saves_updates_deletes_offline_and_rejects_stale_edits() {
+        let home =
+            std::env::temp_dir().join(format!("herdr-manual-memory-{}", super::super::fresh_id()));
+        let a = json!({"action":"save","id":"personal.fixture","expected_revision":0,"title":"先给结论","content":"需要核实证据"});
+        let rows = edit_memory(&home, &a).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["authority"], false);
+        assert!(edit_memory(&home, &a).is_err());
+        let mut a = a;
+        a["expected_revision"] = json!(1);
+        a["content"] = json!("简短报告，附上证据");
+        assert_eq!(edit_memory(&home, &a).unwrap()[0]["revision"], 2);
+        assert!(
+            edit_memory(
+                &home,
+                &json!({"action":"delete","id":"personal.fixture","expected_revision":1})
+            )
+            .is_err()
+        );
+        assert!(
+            edit_memory(
+                &home,
+                &json!({"action":"delete","id":"personal.fixture","expected_revision":2})
+            )
+            .unwrap()
+            .is_empty()
+        );
+        std::fs::remove_dir_all(home).unwrap();
+    }
 }
