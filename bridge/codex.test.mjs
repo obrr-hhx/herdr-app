@@ -18,21 +18,21 @@ if(m.id===999&&m.result){for(const delta of ['hello',' world'])write({method:'it
  Object.assign(process.env,{HERDR_CODEX_BIN:fake,HERDR_APP_BIN:app,HERDR_APP_HOME:root,TEST_TRACE:trace});
  const folder=path.join(root,'conversation');fs.mkdirSync(folder);
  try{
-  for(let run=0;run<3;run++){
+  for(let run=0;run<4;run++){
    const settings={model:'test-model',effort:'high'};const chunks=[];let turns=0;let runner;let callbacks;
    await new Promise((resolve,reject)=>{
     const timer=setTimeout(()=>{runner?.kill();reject(Error('test timeout'));},10000);
-    callbacks={models:models=>{assert.equal(models[0].model,'test-model');assert.equal(models[0].supportedReasoningEfforts[0].reasoningEffort,'high');},ready:model=>{assert.equal(model,'test-model');runner.stdin.write(JSON.stringify({action:'send',request_id:run===2?'observe_checkin_qa':'test-request',text:run===2?'checkin-guard':'test'}));},confirmed:id=>assert.equal(id,run===2?'observe_checkin_qa':'test-request'),delta:(_id,_idx,t)=>chunks.push(t),complete(){},tool(){assert.notEqual(run,2,'Periodic writes must not reach tool execution');},toolResult(_id,value,error){assert.equal(error,false);assert.ok(Array.isArray(value.sessions));},usage(){},failure:reason=>{clearTimeout(timer);runner?.kill();reject(Error(reason));},done(){if(run===0&&++turns===1){settings.effort='';runner.stdin.write(JSON.stringify({action:'send',request_id:'test-request',text:'test default effort'}));return;}clearTimeout(timer);runner.kill();resolve();}};
+    callbacks={models:models=>{assert.equal(models[0].model,'test-model');assert.equal(models[0].supportedReasoningEfforts[0].reasoningEffort,'high');},ready:model=>{assert.equal(model,'test-model');runner.stdin.write(JSON.stringify({action:'send',request_id:run===2?'observe_checkin_qa':run===3?'manual_review_qa':'test-request',text:run>=2?'checkin-guard':'test',memory_snapshot:{version:'fixture-v1',summary:'Stable collaboration summary: fixture preference'}}));},confirmed:id=>assert.equal(id,run===2?'observe_checkin_qa':run===3?'manual_review_qa':'test-request'),delta:(_id,_idx,t)=>chunks.push(t),complete(){},tool(){assert(run<2,'Read-only inspection writes must not reach tool execution');},toolResult(_id,value,error){assert.equal(error,false);assert.ok(Array.isArray(value.sessions));},usage(){},failure:reason=>{clearTimeout(timer);runner?.kill();reject(Error(reason));},done(){if(run===0&&++turns===1){settings.effort='';runner.stdin.write(JSON.stringify({action:'send',request_id:'test-request',text:'test default effort'}));return;}clearTimeout(timer);runner.kill();resolve();}};
     runner=codexRunner(folder,root,callbacks,settings);
    });
    assert.equal(chunks.join(''),run===0?'hello worldhello world':'hello world');
   }
   const records=fs.readFileSync(trace,'utf8').trim().split('\n').map(JSON.parse);
-  assert.equal(records.filter(r=>r.id===999&&r.result?.success===false).length,1,'Check-in mutation was rejected through the real Codex adapter');
+  assert.equal(records.filter(r=>r.id===999&&r.result?.success===false).length,2,'Periodic and manual inspection mutations were rejected through the real Codex adapter');
   const start=records.find(r=>r.method==='thread/start');assert.deepEqual(start.params.environments,[]);assert.equal(start.params.config['mcp_servers.legacy.enabled'],false);assert.equal(start.params.sandbox,'read-only');assert.ok(start.params.dynamicTools.some(t=>t.name==='create_session'));
   assert.equal(records.find(r=>r.method==='thread/resume').params.threadId,'thread-test');
   assert.equal(start.params.model,'test-model');assert.equal(start.params.config.model_reasoning_effort,'high');
-  const turns=records.filter(r=>r.method==='turn/start');assert.deepEqual(turns.map(t=>t.params.effort),['high','medium','high','high']);for(const t of turns)assert.equal(t.params.model,'test-model');
+  const turns=records.filter(r=>r.method==='turn/start');assert.equal(turns[0].params.input[0].text,'test');assert.equal(turns[0].params.input.length,1);assert.match(turns[0].params.additionalContext.herdr_collaboration_memory.value,/fixture preference/);assert.deepEqual(turns.map(t=>t.params.effort),['high','medium','high','high','high']);for(const t of turns)assert.equal(t.params.model,'test-model');
  }finally{for(const k of Object.keys(process.env))if(!(k in saved))delete process.env[k];Object.assign(process.env,saved);fs.rmSync(root,{recursive:true,force:true});}
 });
 

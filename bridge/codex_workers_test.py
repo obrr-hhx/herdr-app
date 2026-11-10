@@ -66,8 +66,6 @@ class Workers(unittest.TestCase):
     def test_dispatch_busy_source_change_and_uncertain_wire_never_duplicate(self):
         bridge,q=self.fixture();bridge.pending.clear();bridge.rows['t2']['read_identity']={'pid':1}
         args={'address':'t2','read_identity':{'pid':1},'text':'Continue','request_id':'dispatch-2'}
-        bridge.client.rpc=lambda *a,**kw:{'thread':{'status':{'type':'active'}}}
-        with self.assertRaises(m.DispatchRefused):bridge.send_message(args)
         with patch.object(m,'source_view',return_value={'thread_id':'thread','proof':'reused'}):
             with self.assertRaises(m.DispatchRefused):bridge.send_message(args)
         def rpc(method,*a,**kw):
@@ -76,6 +74,58 @@ class Workers(unittest.TestCase):
         bridge.client.rpc=rpc
         with self.assertRaises(TimeoutError):bridge.send_message(args)
         with self.assertRaisesRegex(ValueError,'delivery unknown'):bridge.send_message(args)
+
+    def test_busy_followup_is_durable_fifo_and_repeated_clicks_do_not_resubmit(self):
+        bridge,q=self.fixture();bridge.pending.clear();calls=[];active=[True]
+        def rpc(method,args,**kw):
+            calls.append((method,args))
+            if method=='thread/read':return {'thread':{'status':{'type':'active' if active[0] else 'idle'}}}
+            active[0]=True;return {'turn':{'id':'next-turn'}}
+        bridge.client.rpc=rpc
+        a={'address':'t2','text':'Next task','request_id':'queue-first'}
+        self.assertTrue(bridge.send_message(a)['queued']);self.assertFalse(bridge.send_message(a)['confirmed'])
+        bridge.send_message({**a,'request_id':'queue-second','text':'Then another task'})
+        self.assertFalse(any(m=='turn/start' for m,p in calls))
+        # A replacement bridge process recovers only queued intent, not unknown writes.
+        recovered=m.Bridge(bridge.home,'unused')
+        for k in ['client','rows','threads','bound','core']:setattr(recovered,k,getattr(bridge,k))
+        recovered.publish=lambda:None
+        active[0]=False;recovered.drain_followups()
+        starts=[p for m,p in calls if m=='turn/start'];self.assertEqual([p['clientUserMessageId'] for p in starts],['queue-first'])
+        self.assertTrue(recovered.send_message(a)['confirmed'])
+        active[0]=False;recovered.drain_followups()
+        self.assertEqual([p['clientUserMessageId'] for m,p in calls if m=='turn/start'],['queue-first','queue-second'])
+        recovered.drain_followups();self.assertEqual(len([m for m,p in calls if m=='turn/start']),2)
+    def test_steer_targets_verified_active_turn_without_interrupt_or_settings_override(self):
+        bridge,q=self.fixture();bridge.pending.clear();calls=[]
+        def rpc(method,args,**kw):
+            calls.append((method,args))
+            if method=='thread/read':return {'thread':{'status':{'type':'active'}}}
+            if method=='thread/turns/list':return {'data':[{'id':'live-turn','status':'inProgress'}]}
+            return {'turnId':'live-turn'}
+        bridge.client.rpc=rpc
+        a={'address':'t2','text':'Keep scope small','request_id':'steer-active','mode':'steer'}
+        self.assertTrue(bridge.send_message(a)['confirmed']);self.assertEqual(calls[-1],('turn/steer',{'threadId':'thread','expectedTurnId':'live-turn','clientUserMessageId':'steer-active','input':[{'type':'text','text':'Keep scope small'}]}))
+        self.assertEqual(bridge.send_message(a)['mode'],'steer');self.assertEqual(len(calls),3)
+    def test_queue_waits_for_decisions_steer_cannot_approve_and_unknown_send_is_not_replayed(self):
+        bridge,q=self.fixture();calls=[]
+        def rpc(method,args,**kw):
+            calls.append(method)
+            if method=='thread/read':return {'thread':{'status':{'type':'idle'}}}
+            raise TimeoutError('lost acknowledgement')
+        bridge.client.rpc=rpc
+        a={'address':'t2','text':'Follow-up','request_id':'queue-decision'}
+        self.assertTrue(bridge.send_message(a)['queued']);bridge.drain_followups();self.assertNotIn('turn/start',calls)
+        with self.assertRaises(m.DispatchRefused):bridge.send_message({**a,'mode':'steer','request_id':'steer-blocked'})
+        bridge.pending.clear();bridge.drain_followups();self.assertEqual(calls.count('turn/start'),1)
+        bridge.drain_followups();self.assertEqual(calls.count('turn/start'),1)
+        with self.assertRaisesRegex(ValueError,'delivery unknown'):bridge.send_message(a)
+    def test_queued_followup_never_retargets_reused_session_identity(self):
+        bridge,q=self.fixture();bridge.pending.clear()
+        bridge.client.rpc=lambda *a,**kw:{'thread':{'status':{'type':'active'}}}
+        a={'address':'t2','text':'Follow-up','request_id':'queue-identity'}
+        bridge.send_message(a);bridge.bound['t2']['view']['proof']='replacement';bridge.drain_followups()
+        result=bridge.send_message(a);self.assertFalse(result['submitted']);self.assertEqual(result['delivery'],'refused')
 
     def test_plain_text_reply_is_human_verbatim_not_model_rewrite(self):
         bridge,q=self.fixture();bridge.answer({'address':'t2','question_id':q['id'],'intent':{'id':'human','time':q['time']+1,'text':'选 B，保留我的说明。'}})

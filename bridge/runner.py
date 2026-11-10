@@ -10,6 +10,8 @@ import struct
 import sys
 import termios
 import time
+import subprocess
+import re
 
 def shutdown(signum, frame):
     raise SystemExit(0)
@@ -49,6 +51,14 @@ if os.environ.get('HERDR_CHAT_LOCAL') == '1':
         override = json.loads(settings.read_text())
         override['env'] = {**override.get('env', {}), **{k: subscription_env[k] for k in ['ANTHROPIC_AUTH_TOKEN','ANTHROPIC_API_KEY','ANTHROPIC_BASE_URL','CLAUDE_CODE_USE_BEDROCK','CLAUDE_CODE_USE_VERTEX','CLAUDE_CODE_USE_FOUNDRY']}}
         args[args.index('--settings')+1] = json.dumps(override)
+# Probe the CLI without creating another model conversation or exposing credentials.
+try:
+    version = subprocess.run([args[0], '--version'], capture_output=True, text=True, timeout=3)
+    match = re.search(r'(\d+)\.(\d+)\.(\d+)', version.stdout)
+    supports_steer = bool(version.returncode == 0 and match and tuple(map(int, match.groups())) >= (2, 1, 275))
+except (OSError, subprocess.TimeoutExpired):
+    supports_steer = False
+print(json.dumps({'type': 'capabilities', 'steer': supports_steer}), flush=True)
 pid, fd = pty.fork()
 if pid == 0:
     os.chdir(cwd)
@@ -138,7 +148,7 @@ try:
                         if writable:
                             raw = raw[os.write(fd, raw):]
                     time.sleep(.1)
-                    os.write(fd, b'\r')
+                    os.write(fd, b'\x18\x13' if c.get('mode') == 'steer' else b'\r')
                     report('submitted', request_id=c['request_id'])
 finally:
     try:

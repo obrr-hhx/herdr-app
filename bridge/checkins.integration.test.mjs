@@ -1,4 +1,4 @@
-import test from'node:test';import assert from'node:assert/strict';import fs from'node:fs';import path from'node:path';import {spawn}from'node:child_process';import {fileURLToPath}from'node:url';import {setTimeout as delay}from'node:timers/promises';
+import net from'node:net';import test from'node:test';import assert from'node:assert/strict';import fs from'node:fs';import path from'node:path';import {spawn}from'node:child_process';import {fileURLToPath}from'node:url';import {setTimeout as delay}from'node:timers/promises';
 for(const explicit of [true,false])test(`silent inspection ${explicit?'with an agent wait decision':'without a decision'} never publishes buffered output or a visible completion`,async()=>{
  const root=fs.mkdtempSync('/tmp/hfollow-'),home=root+'/home',folder=root+'/conversation';fs.mkdirSync(folder,{recursive:true});fs.mkdirSync(home+'/data/super-agent',{recursive:true});const now=Date.now(),id='observe_checkin_integration';
  fs.writeFileSync(home+'/data/super-agent/sessions.json',JSON.stringify({at:now,core:'unused',sessions:[{address:'t-qa',app:'fixture',status:'working'}]}));
@@ -12,4 +12,23 @@ rl.on('line',line=>{const m=JSON.parse(line),reply=result=>emit({id:m.id,result}
  try{let events=[];for(let i=0;i<300;i++){try{events=fs.readFileSync(folder+'/events.jsonl','utf8').trim().split('\n').map(JSON.parse);}catch{}if(events.some(e=>e.type==='checkin_complete'))break;await delay(40);}
   const completed=events.find(e=>e.type==='checkin_complete');assert(completed,'check-in did not finish');assert.equal(completed.published,false);assert(!events.some(e=>['delta','tool','tool_result'].includes(e.type)));assert(!events.some(e=>e.type==='state'&&e.status==='working'));const plan=events.find(e=>e.type==='followup_plan');assert.equal(plan.mode,'wait');assert.equal(plan.next_at,null);assert.equal(events.filter(e=>e.type==='user').length,1);
  }finally{child.kill('SIGTERM');await new Promise(r=>child.once('exit',r));fs.rmSync(root,{recursive:true,force:true});}
+});
+
+test('manual review queues behind a live turn, coalesces clicks and always publishes without replacing human authority',async()=>{
+ const root=fs.mkdtempSync('/tmp/hreview-'),home=root+'/home',folder=root+'/conversation';fs.mkdirSync(folder,{recursive:true});fs.mkdirSync(home,{recursive:true});
+ fs.writeFileSync(folder+'/events.jsonl',JSON.stringify({type:'settings',provider:'codex',model:'fixture',effort:'',seq:1,time:Date.now()})+'\n');
+ const fake=root+'/codex';fs.writeFileSync(fake,`#!/usr/bin/env node
+ let n=0;const emit=v=>process.stdout.write(JSON.stringify(v)+'\\n');require('readline').createInterface({input:process.stdin}).on('line',l=>{const m=JSON.parse(l),reply=result=>emit({id:m.id,result});if(m.method==='initialize')reply({});if(m.method==='config/read')reply({config:{}});if(m.method==='model/list')reply({data:[{model:'fixture',hidden:false,supportedReasoningEfforts:[]}],nextCursor:null});if(m.method==='thread/start'||m.method==='thread/resume')reply({thread:{id:'qa-thread'},model:'fixture'});if(m.method==='turn/start'){const i=++n;reply({turn:{id:'turn-'+i}});setTimeout(()=>{emit({method:'item/agentMessage/delta',params:{threadId:'qa-thread',itemId:'msg-'+i,delta:i===1?'ordinary answer':'ALL_SESSIONS_REVIEWED'}});emit({method:'item/completed',params:{item:{id:'msg-'+i,type:'agentMessage'}}});emit({method:'turn/completed',params:{turn:{id:'turn-'+i,status:'completed'}}});},i===1?500:100);}});`,{mode:0o700});
+ const app=root+'/app';fs.writeFileSync(app,'#!/bin/sh\nprintf \'{"sessions":[]}\\n\'\n',{mode:0o700});
+ const child=spawn(process.execPath,[fileURLToPath(new URL('./daemon.mjs',import.meta.url)),folder,root,'opus'],{env:{...process.env,HERDR_APP_HOME:home,HERDR_APP_BIN:app,HERDR_CODEX_BIN:fake,HERDR_SUPER_AGENT:'1',HERDR_CHAT_LOCAL:'1',HERDR_CODEX_CONTROL_SOCKET:root+'/none.sock',HERDR_CODEX_WORKER_SOCKET:root+'/workers.sock'},stdio:'ignore'});
+ let socket;const events=()=>fs.readFileSync(folder+'/events.jsonl','utf8').trim().split('\n').map(JSON.parse);
+ const until=async fn=>{for(let i=0;i<300;i++){if(fn())return;await delay(20);}assert.fail('timed out');};
+ try{
+  await until(()=>fs.existsSync(folder+'/run.sock'));socket=net.connect(folder+'/run.sock');await new Promise(r=>socket.once('connect',r));socket.on('data',()=>{});
+  const send=c=>socket.write(JSON.stringify(c)+'\n');send({action:'subscribe',after:0});send({action:'send',request_id:'human_request',text:'Keep my original mandate',images:[]});
+  await until(()=>events().some(e=>e.type==='state'&&e.status==='working'));
+  send({action:'send',request_id:'manual_review_first',text:'[Manual session review] inspect all sessions',images:[]});send({action:'send',request_id:'manual_review_second',text:'[Manual session review] inspect all sessions',images:[]});
+  await until(()=>events().some(e=>e.type==='review_complete'&&e.id==='manual_review_first'));
+  const all=events();assert.equal(all.filter(e=>e.type==='review_requested').length,1);assert.equal(all.filter(e=>e.type==='review_started').length,1);assert(all.some(e=>e.type==='review_complete'&&e.id==='manual_review_second'&&e.outcome==='coalesced'));assert(all.some(e=>e.type==='delta'&&e.text==='ALL_SESSIONS_REVIEWED'));assert.equal(all.filter(e=>e.type==='user').length,1);assert.equal(all.find(e=>e.type==='user').text,'Keep my original mandate');assert(!all.some(e=>e.type==='checkin_complete'));assert(all.findIndex(e=>e.type==='delta'&&e.text==='ordinary answer')<all.findIndex(e=>e.type==='review_started'));
+ }finally{socket?.destroy();child.kill('SIGTERM');await new Promise(r=>child.once('exit',r));fs.rmSync(root,{recursive:true,force:true});}
 });

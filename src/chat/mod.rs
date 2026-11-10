@@ -8,6 +8,7 @@ mod status_line;
 mod transport;
 mod view;
 use serde::{Deserialize, Serialize};
+pub use transport::valid_host;
 pub use view::{ChatEvent, ChatView};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

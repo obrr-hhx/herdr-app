@@ -421,3 +421,39 @@ target/release/herdr-app`, the scoped rustfmt check
 above, and `git diff --check`. The signed local app was reopened; its prior
 manager backend PID was preserved and the existing 18-agent list reappeared.
 The disposable Herdr fixture's daemon/core were stopped after acceptance.
+
+
+## Bounded image-message layout (2026-11-06)
+
+Sent images now reserve a 160×144 logical-pixel preview and contain the image
+independently of intrinsic dimensions. The bubble stacks images above text;
+up to four previews wrap in narrow windows. Image-only messages omit the
+empty text block. Draft thumbnails remain compact and removable.
+
+`cargo test --locked chat::view::interaction_tests -- --test-threads=1`
+passed all 16 interaction tests with Rust 1.95.0 and Zig 0.16.0. The new case
+loads portrait (40×1600), landscape (1600×40), square and another portrait
+image; at 1200/540 window widths it asserts bounded thumbnails, text below
+images, no bubble overflow, image-only layout and preview activation.
+A separate native app home rendered four real PNG fixtures with wrapping
+and a visibly separate caption. No prompts went to real workers. Scoped
+rustfmt, generated documentation checks and `git diff --check` passed.
+The signed local app was updated and reopened with worker sessions retained.
+
+
+## Text-only bubble regression (2026-11-06)
+
+The image-layout change incorrectly put text-only Markdown in an auto-width
+vertical flex container. The reported Chinese message reproduced as a 32px
+wide, 609px tall bubble. Text-only bubbles now use intrinsic block measurement;
+attachment bubbles keep an explicit bounded width and vertical image/text flow.
+The regression test covers the original sentence at 1200/720 widths with the
+decision sidebar open and 540 without it, plus a short reply and long English
+text. The portrait/landscape multi-image test remains in the same suite.
+`cargo test --locked chat::view::interaction_tests -- --test-threads=1`
+passed all 17 tests (Rust 1.95.0, Zig 0.16.0).
+The isolated native window showed the exact reported Chinese sentence in a
+normal horizontal bubble, a compact single-character reply and unchanged image
+layout with the sidebar open. After updating the signed installed client, the
+real existing message was also visibly horizontal; all eight core sessions
+were retained. Generated docs checks and scoped rustfmt passed.

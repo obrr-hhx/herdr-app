@@ -62,6 +62,13 @@ class Reads(unittest.TestCase):
         self.assertEqual(r['pending_permissions']['q']['name'], 'AskUserQuestion')
         self.assertEqual(p.read_bytes(), data)
 
+    def test_native_steering_receipts_are_available_without_reading_the_terminal(self):
+        ident='b'*32;p=self.home/'data/forge-chat'/ident/'events.jsonl';p.parent.mkdir(parents=True)
+        events=[{'type':'state','status':'working','active_turn':'original'}, {'type':'user','id':'s','text':'change','mode':'steer'}, {'type':'dispatch_receipt','id':'s','mode':'steer','stage':'submitted'}, {'type':'prompt_confirmed','id':'s','mode':'steer'}]
+        p.write_text(''.join(json.dumps(e)+'\n' for e in events))
+        r=m.local_native(self.home,{'conversation':ident},0,4)
+        self.assertEqual(r['dispatches']['s']['stage'],'confirmed');self.assertEqual(r['active_turn'],'original')
+
     def test_timeout_falls_back_but_never_reuses_another_occupants_cache(self):
         row = {'address':'t1','read_identity':{'pid':1},'read_source':{'kind':'core'},'status':'working'}
         m.save(self.home,row,{'text':'previous evidence','captured_at':100,'source':'terminal_screen'},self.redact)

@@ -1,4 +1,10 @@
 mod decision_sidebar;
+struct MemoryEditor {
+    id: String,
+    revision: u64,
+    title: Entity<InputState>,
+    content: Entity<TextareaState>,
+}
 use super::attachments;
 use super::composer::{self, Choice, Menu};
 use super::presentation::{self, HistoryRow};
@@ -83,6 +89,15 @@ pub struct ChatView {
     pane_height: std::rc::Rc<std::cell::Cell<f32>>,
     pane_width: std::rc::Rc<std::cell::Cell<f32>>,
     decision_rows: Vec<Value>,
+    goal_rows: Vec<Value>,
+    memory_rows: Vec<Value>,
+    memory_snapshot: Value,
+    memory_records: bool,
+    memory_editor: Option<MemoryEditor>,
+    memory_saving: bool,
+    memory_delete: Option<(String, u64)>,
+    decision_memory: bool,
+    decision_goals: bool,
     decision_error: String,
     decision_open: Option<bool>,
     decision_completed: bool,
@@ -93,6 +108,8 @@ pub struct ChatView {
     expanded: HashSet<String>,
     answers: HashMap<String, HashMap<String, String>>,
     decisions_in_flight: HashSet<String>,
+    session_review_id: Option<String>,
+    session_review_started: bool,
     history_ok: bool,
     free_answers: HashMap<(String, String), Entity<InputState>>,
     installing: bool,
@@ -188,10 +205,30 @@ impl ChatView {
             }
         });
         let mut conversation = Conversation::default();
+        let mut session_review_id = None;
+        let mut session_review_started = false;
+        let mut completed_reviews = HashSet::new();
         let history = transport::load_history(&dir.join("events.jsonl"));
         let cache_error = history.is_err();
         if let Ok(history) = history {
             for e in history {
+                if e["type"] == "review_requested" {
+                    session_review_id = e["id"].as_str().map(str::to_owned);
+                    session_review_started = false;
+                }
+                if e["type"] == "review_started" && e["id"].as_str() == session_review_id.as_deref()
+                {
+                    session_review_started = true;
+                }
+                if e["type"] == "review_complete" {
+                    if let Some(id) = e["id"].as_str() {
+                        completed_reviews.insert(id.to_owned());
+                    }
+                    if e["id"].as_str() == session_review_id.as_deref() {
+                        session_review_id = None;
+                        session_review_started = false;
+                    }
+                }
                 conversation.apply(&e);
             }
         }
@@ -201,8 +238,11 @@ impl ChatView {
             {
                 for (id, command) in pending {
                     if command["action"] == "send" {
+                        if id.starts_with("manual_review_") && !completed_reviews.contains(&id) {
+                            session_review_id = Some(id.clone());
+                        }
                         if let Some(text) = command["text"].as_str() {
-                            conversation.apply(&json!({"type":"user","id":id,"text":text,"images":command["images"]}));
+                            conversation.apply(&json!({"type":"user","id":id,"text":if id.starts_with("manual_review_") {"检查全部会话并同步最新进展。"} else {text},"images":command["images"]}));
                         }
                     }
                 }
@@ -227,6 +267,15 @@ impl ChatView {
             pane_height: std::rc::Rc::new(std::cell::Cell::new(0.)),
             pane_width: std::rc::Rc::new(std::cell::Cell::new(0.)),
             decision_rows: super::decisions::read().unwrap_or_default(),
+            goal_rows: Self::load_goals(),
+            memory_rows: Self::load_memories(),
+            memory_snapshot: Self::load_memory_snapshot(),
+            memory_records: false,
+            memory_editor: None,
+            memory_saving: false,
+            memory_delete: None,
+            decision_memory: false,
+            decision_goals: true,
             decision_error: String::new(),
             decision_open: None,
             decision_completed: false,
@@ -237,6 +286,8 @@ impl ChatView {
             expanded: HashSet::new(),
             answers: HashMap::new(),
             decisions_in_flight: HashSet::new(),
+            session_review_id,
+            session_review_started,
             history_ok: !cache_error,
             free_answers: HashMap::new(),
             installing: false,
@@ -261,18 +312,32 @@ impl ChatView {
                 loop {
                     cx.background_executor().timer(Duration::from_secs(2)).await;
                     if view
-                        .update(cx, |this, cx| match super::decisions::read() {
-                            Ok(rows) if rows != this.decision_rows => {
-                                this.decision_rows = rows;
-                                this.decision_error.clear();
+                        .update(cx, |this, cx| {
+                            let snapshot = Self::load_memory_snapshot();
+                            if snapshot != this.memory_snapshot {
+                                this.memory_rows =
+                                    snapshot["memories"].as_array().cloned().unwrap_or_default();
+                                this.memory_snapshot = snapshot;
                                 cx.notify();
                             }
-                            Ok(_) => {}
-                            Err(e) if e != this.decision_error => {
-                                this.decision_error = e;
+                            let goals = Self::load_goals();
+                            if goals != this.goal_rows {
+                                this.goal_rows = goals;
                                 cx.notify();
                             }
-                            Err(_) => {}
+                            match super::decisions::read() {
+                                Ok(rows) if rows != this.decision_rows => {
+                                    this.decision_rows = rows;
+                                    this.decision_error.clear();
+                                    cx.notify();
+                                }
+                                Ok(_) => {}
+                                Err(e) if e != this.decision_error => {
+                                    this.decision_error = e;
+                                    cx.notify();
+                                }
+                                Err(_) => {}
+                            }
                         })
                         .is_err()
                     {
@@ -347,9 +412,17 @@ impl ChatView {
     fn image_strip(&self, ids: &[String], removable: bool, cx: &mut Context<Self>) -> AnyElement {
         let mut row = div()
             .id("images-strip")
+            .debug_selector(move || {
+                if removable {
+                    "chat-draft-images".into()
+                } else {
+                    "chat-images".into()
+                }
+            })
             .w_full()
             .min_w_0()
             .flex()
+            .flex_wrap()
             .gap_2()
             .max_w_full();
         for id in ids {
@@ -360,21 +433,29 @@ impl ChatView {
             row = row.child(
                 div()
                     .id(SharedString::from(format!("image-{removable}-{id}")))
-                    .flex_1()
-                    .min_w_0()
-                    .max_w(px(90.))
+                    .debug_selector(|| "chat-image-thumb".into())
+                    .w(px(if removable { 90. } else { 160. }))
+                    .h(px(if removable && self.status_expanded {
+                        48.
+                    } else if removable {
+                        64.
+                    } else {
+                        144.
+                    }))
+                    .max_w_full()
+                    .flex_shrink_0()
                     .relative()
+                    .overflow_hidden()
                     .rounded_md()
                     .border_1()
                     .border_color(color("border"))
                     .child(
+                        // Keep intrinsic image dimensions out of flex/list measurement.
+                        // In particular, tall screenshots must not paint over the text below.
                         img(path)
-                            .w_full()
-                            .h(px(if removable && self.status_expanded {
-                                48.
-                            } else {
-                                64.
-                            }))
+                            .absolute()
+                            .inset_0()
+                            .size_full()
                             .object_fit(ObjectFit::Contain)
                             .cursor_pointer(),
                     )
@@ -453,6 +534,7 @@ impl ChatView {
                     .update(cx, |this, cx| {
                         let mut changed = false;
                         for e in batch {
+                            this.session_review_event(&e, cx);
                             if e["type"] == "reminder_ack" {
                                 if let Some(id) = e["id"].as_str() {
                                     cx.dismiss_system_notification(&format!("herdr-reminder:{id}"));
@@ -462,6 +544,14 @@ impl ChatView {
                                 && e["request_id"].as_str() != Some(this.workspace_request.as_str())
                             {
                                 continue;
+                            }
+                            if e["type"] == "dispatch_receipt"
+                                && matches!(e["stage"].as_str(), Some("refused" | "unknown"))
+                            {
+                                this.notice = e["reason"]
+                                    .as_str()
+                                    .unwrap_or("调整指令尚未确认，请检查原会话。")
+                                    .into();
                             }
                             if e["type"] == "prompt_confirmed" || e["type"] == "permission_resolved"
                             {
@@ -533,11 +623,12 @@ impl ChatView {
         let id = value["request_id"].as_str().unwrap_or_default().to_owned();
         let text = value["text"].as_str().map(str::to_owned);
         let images = value["images"].clone();
+        let mode = value["mode"].clone();
         let sent = self.connection.as_ref().is_some_and(|c| c.send(value));
         if sent {
             if let Some(text) = text {
                 self.conversation
-                    .apply(&json!({"type":"user","id":id,"text":text,"images":images}));
+                    .apply(&json!({"type":"user","id":id,"text":text,"images":images,"mode":mode}));
                 self.sync_rows();
             }
         }
@@ -546,6 +637,81 @@ impl ChatView {
             cx.notify();
         }
         sent
+    }
+    fn load_memory_snapshot() -> Value {
+        std::fs::read(crate::mods::app_dir().join("data/super-agent/memories.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+            .unwrap_or(json!({}))
+    }
+    fn load_memories() -> Vec<Value> {
+        Self::load_memory_snapshot()["memories"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+    }
+    fn load_goals() -> Vec<Value> {
+        let path = crate::mods::app_dir().join("data/super-agent/goals.json");
+        std::fs::read(path)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+            .and_then(|v| v["goals"].as_array().cloned())
+            .unwrap_or_default()
+    }
+    fn check_sessions(&mut self, cx: &mut Context<Self>) {
+        if self.config.id != super::SUPER_ID || self.session_review_id.is_some() {
+            return;
+        }
+        if !self
+            .conversation
+            .capabilities
+            .iter()
+            .any(|c| c == "session_review")
+        {
+            self.notice = "管家连接尚未就绪或需要更新，连接后可重试；草稿已保留。".into();
+            cx.notify();
+            return;
+        }
+        let id = format!("manual_review_{}", fresh_id());
+        let text = "[Manual session review]\n请现在检查全部本地和远程会话，并向我同步最新进展。先用 list_sessions、inspect_sessions 分批检查所有会话，必要时 read_session 核对原始证据。优先说明真正需要我决策的问题、待验收结果和重要阻塞，再简要概括其余进展；指出读取失败或陈旧信息，不要把未知当成空闲或完成。先看已有决策和我的历史答复，避免重复挂卡。此次点击只授权读取、整理决策清单并汇报；不要派工、回复 worker、接受任务、审批、合并或部署。即使没有新变化也要明确回复检查结果，不要静默。";
+        if !self.connection.as_ref().is_some_and(|c| {
+            c.send(json!({"action":"send","request_id":id,"text":text,"images":[]}))
+        }) {
+            self.notice = "检查尚未加入队列，连接后可重试；草稿已保留。".into();
+            cx.notify();
+            return;
+        }
+        self.conversation.apply(
+            &json!({"type":"review_requested","id":id,"text":"检查全部会话并同步最新进展。"}),
+        );
+        self.session_review_id = Some(id);
+        self.session_review_started = false;
+        self.notice.clear();
+        self.sync_rows();
+        cx.notify();
+    }
+    fn session_review_event(&mut self, event: &Value, cx: &mut Context<Self>) {
+        if self.session_review_id.is_none()
+            || event["id"].as_str() != self.session_review_id.as_deref()
+        {
+            return;
+        }
+        if event["type"] == "review_started" {
+            self.session_review_started = true;
+            cx.notify();
+        }
+        if event["type"] == "review_complete" {
+            self.session_review_id = None;
+            self.session_review_started = false;
+            match event["outcome"].as_str() {
+                Some("completed") => {}
+                Some("coalesced") => {
+                    self.notice = "已有一次会话检查正在进行或排队，未重复提交。".into()
+                }
+                _ => self.notice = "本次检查已中断，可点击重试；不会自动重复提交。".into(),
+            }
+            cx.notify();
+        }
     }
     fn request_workspace(&mut self, query: String, cx: &mut Context<Self>) {
         let id = fresh_id();
@@ -857,7 +1023,23 @@ impl ChatView {
         cx.notify();
         true
     }
+    pub fn can_steer(&self) -> bool {
+        self.config.id != super::SUPER_ID
+            && self.conversation.capabilities.iter().any(|c| c == "steer")
+    }
     pub fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.editor.read(cx).value();
+        let steer = self.can_steer()
+            && self.conversation.status == "working"
+            && !text.trim_start().starts_with(['/', '!']);
+        self.send_mode(if steer { "steer" } else { "queue" }, window, cx);
+    }
+    fn send_mode(&mut self, mode: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if mode == "steer" && (!self.can_steer() || !self.conversation.permissions.is_empty()) {
+            self.notice = "先处理待确认事项；steer 不会替你批准工具，草稿已保留。".into();
+            cx.notify();
+            return;
+        }
         let text = self.editor.read(cx).value().to_string();
         if self.installing {
             self.notice = "Wait for the service update; your draft is kept.".into();
@@ -897,7 +1079,7 @@ impl ChatView {
         }
         self.menu = None;
         if self.command(
-            json!({"action":"send","text":text,"images":self.draft_images}),
+            json!({"action":"send","text":text,"images":self.draft_images,"mode":mode,"expected_turn":self.conversation.active_turn}),
             cx,
         ) {
             self.editor
@@ -906,17 +1088,38 @@ impl ChatView {
             self.draft_images.clear();
             attachments::save_draft(&transport::local_dir(&self.config.id), &self.draft_images);
             self.list.set_follow_mode(FollowMode::Tail);
-            self.notice = "Sending…".into();
+            self.notice = if mode=="steer" {"正在发送调整指令，等待 Claude 确认…"} else if self.conversation.status=="working" {"已加入发送队列，等本轮结束"} else {"Sending…"}.into();
             cx.notify();
         }
     }
     /// Background delegation never edits the person's draft or scroll position.
-    pub fn delegate(
+    pub fn delegate_mode(
         &mut self,
         text: &str,
         id: &str,
+        mode: &str,
         cx: &mut Context<Self>,
     ) -> Result<Value, String> {
+        if !matches!(mode, "queue" | "steer") {
+            return Err("Unsupported follow-up mode; nothing sent".into());
+        }
+        if mode == "steer" {
+            if !self.can_steer() {
+                return Err(
+                    "Native steering unavailable; update this runtime when idle; nothing sent"
+                        .into(),
+                );
+            }
+            if self.conversation.status != "working" || self.conversation.active_turn.is_empty() {
+                return Err("No verified active turn; nothing sent".into());
+            }
+            if !self.conversation.permissions.is_empty() {
+                return Err("Pending approval blocks steering; nothing sent".into());
+            }
+            if text.trim_start().starts_with(['/', '!']) {
+                return Err("Steering accepts conversation text only; nothing sent".into());
+            }
+        }
         if text.trim().is_empty()
             || text.len() > 256 * 1024
             || text
@@ -925,18 +1128,14 @@ impl ChatView {
         {
             return Err("Invalid message".into());
         }
-        if !self.editor.read(cx).value().trim().is_empty() || !self.draft_images.is_empty() {
-            return Err("User draft in progress; no message sent".into());
-        }
-        if self.conversation.status != "idle" || !self.conversation.permissions.is_empty() {
-            return Err("Session is not idle; no message sent".into());
-        }
-        let c = json!({"action":"send","request_id":id,"text":text,"images":[]});
+        // The daemon serializes follow-ups after the current turn. Pending
+        // approvals remain unresolved; queuing never answers them.
+        let c = json!({"action":"send","request_id":id,"text":text,"images":[],"mode":mode,"expected_turn":self.conversation.active_turn});
         if !self.connection.as_ref().is_some_and(|conn| conn.send(c)) {
             return Err("Could not queue message".into());
         }
         cx.notify();
-        Ok(json!({"queued":true,"request_id":id,"confirmed":false}))
+        Ok(json!({"queued":true,"request_id":id,"confirmed":false,"mode":mode}))
     }
     pub fn manager_provider(
         &mut self,
@@ -970,7 +1169,7 @@ impl ChatView {
         let messages = &self.conversation.messages;
         let end = messages.len().saturating_sub(offset);
         let start = end.saturating_sub(limit.clamp(1, 40));
-        json!({"messages":messages[start..end].iter().map(|m|json!({"id":m.id,"role":m.role,"text":m.text.chars().take(12000).collect::<String>(),"images":m.images})).collect::<Vec<_>>(),"next_offset":(start>0).then_some(offset+end-start),"status":self.conversation.status,"cursor":self.conversation.cursor,"pending_permissions":self.conversation.permissions})
+        json!({"messages":messages[start..end].iter().map(|m|json!({"id":m.id,"role":m.role,"text":m.text.chars().take(12000).collect::<String>(),"images":m.images})).collect::<Vec<_>>(),"next_offset":(start>0).then_some(offset+end-start),"status":self.conversation.status,"cursor":self.conversation.cursor,"pending_permissions":self.conversation.permissions,"dispatches":self.conversation.dispatches,"active_turn":self.conversation.active_turn,"steer_available":self.can_steer()})
     }
     pub fn agent_word(&self) -> Option<&'static str> {
         (self.conversation.cursor > 0).then(|| self.conversation.agent_word())
@@ -1007,7 +1206,7 @@ impl ChatView {
         cx.notify();
     }
     pub fn status(&self, cx: &App) -> Value {
-        json!({"history_rows":self.rows.len(),"tool_groups":self.rows.iter().filter(|r|r.tools).count(),"open_tool_groups":self.expanded.iter().filter(|id|id.starts_with("tools:")).count(),"sending_decisions":self.decisions_in_flight,"provider":self.conversation.provider,"host":self.config.host,"folder":self.config.folder,"conversation":self.config.id,"cursor":self.conversation.cursor,"messages":self.conversation.messages.len(),"pending_permissions":self.conversation.permissions.len(),"unread_reminders":self.conversation.reminders.len(),"reminder_ids":self.conversation.reminders.keys().collect::<Vec<_>>(),"status":self.conversation.status,"status_line":self.conversation.status_line,"permission_mode":self.conversation.permission_mode,"activity_phase":self.conversation.phase,"last_progress":self.conversation.last_progress,"draft_bytes":self.editor.read(cx).value().len(),"draft_images":self.draft_images,"image_preview_open":self.preview_image.is_some(),"draft_scroll_y":f32::from(self.editor.read(cx).scroll_offset().y),"draft_visible_rows":self.editor.read(cx).visible_row_range(),"scroll_item":self.list.logical_scroll_top().item_ix,"scroll_offset":f32::from(self.list.logical_scroll_top().offset_in_item),"following":self.list.is_following_tail(),"models":self.conversation.models,"model":self.conversation.model.as_deref().unwrap_or(&self.config.model),"effort":self.conversation.effort,"workspace_files":self.conversation.files.len(),"menu":format!("{:?}",self.menu),"menu_index":self.menu_index,"menu_choices":self.choices().iter().map(|c|c.value.clone()).collect::<Vec<_>>()})
+        json!({"history_rows":self.rows.len(),"tool_groups":self.rows.iter().filter(|r|r.tools).count(),"open_tool_groups":self.expanded.iter().filter(|id|id.starts_with("tools:")).count(),"sending_decisions":self.decisions_in_flight,"memories":self.memory_rows.len(),"memory_tab":self.decision_memory,"memory_records":self.memory_records,"memory_summary_compiled":self.memory_snapshot["compiled"],"goals":self.goal_rows.len(),"goals_tab":self.decision_goals,"session_review_id":self.session_review_id,"session_review_started":self.session_review_started,"provider":self.conversation.provider,"host":self.config.host,"folder":self.config.folder,"conversation":self.config.id,"cursor":self.conversation.cursor,"messages":self.conversation.messages.len(),"pending_permissions":self.conversation.permissions.len(),"unread_reminders":self.conversation.reminders.len(),"reminder_ids":self.conversation.reminders.keys().collect::<Vec<_>>(),"status":self.conversation.status,"status_line":self.conversation.status_line,"permission_mode":self.conversation.permission_mode,"activity_phase":self.conversation.phase,"last_progress":self.conversation.last_progress,"draft_bytes":self.editor.read(cx).value().len(),"draft_images":self.draft_images,"image_preview_open":self.preview_image.is_some(),"draft_scroll_y":f32::from(self.editor.read(cx).scroll_offset().y),"draft_visible_rows":self.editor.read(cx).visible_row_range(),"scroll_item":self.list.logical_scroll_top().item_ix,"scroll_offset":f32::from(self.list.logical_scroll_top().offset_in_item),"following":self.list.is_following_tail(),"models":self.conversation.models,"model":self.conversation.model.as_deref().unwrap_or(&self.config.model),"effort":self.conversation.effort,"workspace_files":self.conversation.files.len(),"menu":format!("{:?}",self.menu),"menu_index":self.menu_index,"menu_choices":self.choices().iter().map(|c|c.value.clone()).collect::<Vec<_>>()})
     }
     fn install_bridge(&mut self, cx: &mut Context<Self>) {
         if self.installing {
@@ -1454,23 +1653,64 @@ impl ChatView {
         };
         let id = m.id.clone();
         let copy = m.text.clone();
+        let receipt = self
+            .conversation
+            .dispatches
+            .get(&m.id)
+            .filter(|r| r["mode"] == "steer");
         let body = if m.role == "You" {
             div().w_full().flex().justify_end().py_3().child(
                 div()
                     .id(SharedString::from(format!("user-bubble-{id}")))
+                    .debug_selector(|| "chat-user-bubble".into())
                     .max_w(relative(0.85))
+                    // Markdown needs an intrinsic-width block for text-only bubbles.
+                    // Only attachment bubbles use the explicit vertical flex layout.
+                    .when(!m.images.is_empty(), |el| {
+                        el.w(relative(0.85)).min_w_0().flex().flex_col().gap_3()
+                    })
                     .px_4()
                     .py_3()
                     .rounded_lg()
                     .bg(color("input"))
-                    .child(self.image_strip(&m.images, false, cx))
-                    .child(
-                        TextView::markdown(
-                            SharedString::from(format!("chat-user-{id}")),
-                            m.text.clone(),
+                    .when(!m.images.is_empty(), |el| {
+                        el.child(self.image_strip(&m.images, false, cx))
+                    })
+                    .when(!m.text.is_empty() && m.images.is_empty(), |el| {
+                        el.child(
+                            TextView::markdown(
+                                SharedString::from(format!("chat-user-{id}")),
+                                m.text.clone(),
+                            )
+                            .selectable(true),
                         )
-                        .selectable(true),
-                    ),
+                    })
+                    .when(!m.text.is_empty() && !m.images.is_empty(), |el| {
+                        el.child(
+                            div()
+                                .id(SharedString::from(format!("user-text-{id}")))
+                                .debug_selector(|| "chat-user-text".into())
+                                .min_w_0()
+                                .child(
+                                    TextView::markdown(
+                                        SharedString::from(format!("chat-user-{id}")),
+                                        m.text.clone(),
+                                    )
+                                    .selectable(true),
+                                ),
+                        )
+                    })
+                    .when_some(receipt, |el, r| {
+                        el.child(div().mt_1().text_xs().text_color(color("dim")).child(
+                            match r["stage"].as_str().unwrap_or_default() {
+                                "confirmed" => "已送达 Claude · 调整方向",
+                                "refused" => "调整指令未发送",
+                                "unknown" => "调整指令送达待核实",
+                                "cancelled" => "调整指令已取消",
+                                _ => "正在发送调整指令…",
+                            },
+                        ))
+                    }),
             )
         } else {
             div()
@@ -1728,7 +1968,11 @@ impl Render for ChatView {
                             .text_color(color("dim"))
                             .child(format!(
                                 "{}  ·  {}  ⌄",
-                                if self.config.id==super::SUPER_ID {"Session manager"}else{&self.config.host},
+                                if self.config.id == super::SUPER_ID {
+                                    "Session manager"
+                                } else {
+                                    &self.config.host
+                                },
                                 self.config.folder.rsplit('/').next().unwrap_or("Project")
                             ))
                             .on_click(cx.listener(|this, _, _, cx| {
@@ -1751,18 +1995,70 @@ impl Render for ChatView {
                                     }))
                                     .child(status),
                             )
-                            .when(self.config.id == super::SUPER_ID, |el| el.child(
-                                div().id("decision-toggle").debug_selector(|| "decision-toggle".into())
-                                    .cursor_pointer().text_sm().child(format!("☷ 待你决策 {}", self.decision_rows.iter().filter(|r| r["status"] != "resolved").count()))
-                                    .on_click(cx.listener(|this, _, _, cx| { this.decision_open = Some(!this.decision_open.unwrap_or(this.pane_width.get() >= 940.)); cx.notify(); }))
-                            ))
+                            .when(self.config.id == super::SUPER_ID, |el| {
+                                el.child(
+                                    div()
+                                        .id("decision-toggle")
+                                        .debug_selector(|| "decision-toggle".into())
+                                        .cursor_pointer()
+                                        .text_sm()
+                                        .child(format!(
+                                            "☷ 待你决策 {}",
+                                            self.decision_rows
+                                                .iter()
+                                                .filter(|r| super::decisions::needs_attention(r))
+                                                .count()
+                                        ))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.decision_open = Some(
+                                                !this
+                                                    .decision_open
+                                                    .unwrap_or(this.pane_width.get() >= 940.),
+                                            );
+                                            cx.notify();
+                                        })),
+                                )
+                            })
+                            .when(self.config.id == super::SUPER_ID, |el| {
+                                el.child(
+                                    div()
+                                        .id("memory-open")
+                                        .debug_selector(|| "memory-open".into())
+                                        .cursor_pointer()
+                                        .text_sm()
+                                        .child("记忆")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.decision_open = Some(true);
+                                            this.decision_memory = true;
+                                            this.decision_scroll.set_offset(point(px(0.), px(0.)));
+                                            cx.notify();
+                                        })),
+                                )
+                            })
                             .child(
                                 div()
                                     .id("chat-new")
                                     .cursor_pointer()
-                                    .child(if self.config.id==super::SUPER_ID {"Manage sessions"}else{"＋ New chat"})
+                                    .debug_selector(|| "chat-session-review".into())
+                                    .when(self.session_review_id.is_some(), |el| el.opacity(0.6))
+                                    .child(if self.config.id == super::SUPER_ID {
+                                        if self.session_review_id.is_some() {
+                                            if self.session_review_started {
+                                                "正在检查…"
+                                            } else {
+                                                "检查已排队…"
+                                            }
+                                        } else {
+                                            "检查全部会话"
+                                        }
+                                    } else {
+                                        "＋ New chat"
+                                    })
                                     .on_click(cx.listener(|this, _, _, cx| {
-                                        if this.config.id==super::SUPER_ID {this.notice="Tell Super Agent what to do; it can create local or remote workers for you.".into();cx.notify();return;}
+                                        if this.config.id == super::SUPER_ID {
+                                            this.check_sessions(cx);
+                                            return;
+                                        }
                                         cx.emit(ChatEvent::NewConversation {
                                             host: this.config.host.clone(),
                                             folder: this.config.folder.clone(),
@@ -2241,7 +2537,8 @@ impl Render for ChatView {
                     .map(|el|el.child(div().id("chat-effort").cursor_pointer().child(format!("{effort} ⌄")).on_click(cx.listener(|this,_,window,cx|{this.toggle_menu(Menu::Effort,window,cx); })))))
                 .child(div().flex().gap_3().items_center()
                     .when(busy,|el|el.child(div().id("chat-interrupt").w_8().h_8().flex().items_center().justify_center().rounded_full().bg(color("text")).text_color(color("bg")).cursor_pointer().child("■").on_click(cx.listener(|this,_,_,cx|{this.command(json!({"action":"interrupt"}),cx);}))))
-                    .when(!busy,|el|el.child(div().id("chat-send").w_8().h_8().flex().items_center().justify_center().rounded_full().bg(color("text")).text_color(color("bg")).when(empty,|el|el.opacity(0.35)).cursor_pointer().child("↑").on_click(cx.listener(|this,_,window,cx|this.send(window,cx)))))))
+                    .when(busy && !empty && self.can_steer(),|el|el.child(div().id("chat-queue").debug_selector(||"chat-queue".into()).cursor_pointer().text_sm().child("排队").on_click(cx.listener(|this,_,window,cx|this.send_mode("queue",window,cx)))))
+                    .when(!busy || !empty,|el|el.child(div().id("chat-send").debug_selector(||"chat-send".into()).w_8().h_8().flex().items_center().justify_center().rounded_full().bg(color("text")).text_color(color("bg")).when(empty,|el|el.opacity(0.35)).cursor_pointer().when(busy,|el|el.w_auto().px_2().text_sm()).child(if busy && self.can_steer() {"调整 ↑"}else if busy {"排队 ↑"}else{"↑"}).on_click(cx.listener(|this,_,window,cx|this.send(window,cx)))))))
             ;
 
         footer = footer.child(
@@ -2326,7 +2623,11 @@ impl Render for ChatView {
                         .text_color(color("dim"))
                         .px_2()
                         .pt_1()
-                        .child("Shift + Enter for a new line"),
+                        .child(if busy && self.can_steer() {
+                            "Enter 调整方向 · 排队等本轮结束 · Shift + Enter 换行"
+                        } else {
+                            "Shift + Enter for a new line"
+                        }),
                 )
             },
         );
@@ -2785,8 +3086,459 @@ mod interaction_tests {
         ] {
             view.conversation.apply(&e);
         }
+        view.decision_goals = false;
         view.sync_rows();
         view
+    }
+    #[gpui::test]
+    fn text_only_message_keeps_readable_width_with_sidebar(cx: &mut TestAppContext) {
+        let _home = Home::new();
+        cx.update(gpui_shell::init);
+        let (view,cx) = cx.add_window_view(|window,cx| {
+            let mut v=fixture(window,cx);
+            v.config.id=super::super::SUPER_ID.into();
+            v.conversation.messages.clear();
+            v.conversation.apply(&json!({"type":"user","id":"text-width","text":"推进一下这个 oom 根因调查，不要只给我中间结果。"}));
+            v.sync_rows();v
+        });
+        for (width, sidebar) in [(1200., true), (720., true), (540., false)] {
+            view.update(cx, |v, cx| {
+                v.decision_open = Some(sidebar);
+                cx.notify();
+            });
+            cx.simulate_resize(size(px(width), px(900.)));
+            cx.run_until_parked();
+            let bubble = cx.debug_bounds("chat-user-bubble").unwrap();
+            let viewport = cx.debug_bounds("chat-history-viewport").unwrap();
+            assert!(
+                bubble.size.width > px(150.),
+                "collapsed message: width={width}, bubble={bubble:?}, viewport={viewport:?}"
+            );
+            assert!(
+                bubble.size.height < px(250.),
+                "one-character column: {bubble:?}"
+            );
+        }
+        for (text,max_height) in [("好".to_string(),80.),("Please investigate the OOM root cause and continue within the existing authorization. ".repeat(8),500.)] {
+            view.update(cx,|v,cx| {v.conversation.messages[0].text=text.clone();v.list.remeasure_items(0..1);cx.notify();});
+            cx.run_until_parked();
+            let bubble=cx.debug_bounds("chat-user-bubble").unwrap();
+            assert!(bubble.size.height < px(max_height),"text height: {bubble:?}");
+            if text=="好" {assert!(bubble.size.width < px(100.),"short message must stay compact");}
+        }
+    }
+    #[gpui::test]
+    fn image_messages_keep_portrait_and_landscape_inside_bubble(cx: &mut TestAppContext) {
+        let _home = Home::new();
+        cx.update(gpui_shell::init);
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let mut v = fixture(window, cx);
+            let dir = super::transport::local_dir(&v.config.id);
+            let ids: Vec<_> = [(40, 1600), (1600, 40), (300, 300), (100, 700)]
+                .into_iter().map(|(w,h)| {
+                    let mut data = std::io::Cursor::new(Vec::new());
+                    image::DynamicImage::new_rgb8(w,h).write_to(&mut data, image::ImageFormat::Png).unwrap();
+                    super::attachments::save(&dir, data.get_ref()).unwrap()
+                }).collect();
+            v.conversation.messages.clear();
+            v.conversation.apply(&json!({"type":"user","id":"image-layout","text":"长图说明必须完整显示在图片下方，不能互相覆盖。","images":ids}));
+            v.sync_rows();
+            v
+        });
+        for width in [1200., 540.] {
+            cx.simulate_resize(size(px(width), px(1000.)));
+            cx.run_until_parked();
+            let bubble = cx.debug_bounds("chat-user-bubble").unwrap();
+            let strip = cx.debug_bounds("chat-images").unwrap();
+            let text = cx.debug_bounds("chat-user-text").unwrap();
+            let thumb = cx.debug_bounds("chat-image-thumb").unwrap();
+            assert!(thumb.size.height <= px(144.));
+            assert!(
+                strip.bottom() <= text.top(),
+                "width={width} bubble={bubble:?} strip={strip:?} text={text:?} thumb={thumb:?}"
+            );
+            assert!(strip.right() <= bubble.right());
+            assert!(text.bottom() <= bubble.bottom());
+            assert!(strip.size.height >= px(144.));
+        }
+        view.update(cx, |v, cx| {
+            v.conversation.messages[0].text.clear();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("chat-user-text").is_none());
+        let bounds = cx.debug_bounds("chat-image-thumb").unwrap();
+        cx.simulate_click(bounds.center(), Modifiers::default());
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |v, _| v.preview_image.is_some()));
+    }
+    #[gpui::test]
+    fn collaboration_memory_has_direct_add_edit_delete_and_preserves_chat_draft(
+        cx: &mut TestAppContext,
+    ) {
+        let _home = Home::new();
+        cx.update(gpui_shell::init);
+        let (view,cx)=cx.add_window_view(|window,cx| {
+            let mut v=fixture(window,cx);v.config.id=super::super::SUPER_ID.into();v.decision_open=Some(false);
+            v.memory_rows=vec![json!({"id":"report.evidence","revision":1,"title":"先给证据","content":"持续核实根因","sources":[]})];
+            v.editor.update(cx,|s,cx|s.set_value("保留聊天草稿",window,cx));v
+        });
+        cx.simulate_resize(size(px(1200.), px(950.)));
+        cx.run_until_parked();
+        let bounds = cx.debug_bounds("memory-open").unwrap();
+        cx.simulate_click(bounds.center(), Modifiers::default());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("memory-summary").is_some());
+        let bounds = cx.debug_bounds("memory-records-tab").unwrap();
+        cx.simulate_click(bounds.center(), Modifiers::default());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("memory-edit").is_some());
+        assert!(cx.debug_bounds("memory-delete").is_some());
+        let bounds = cx.debug_bounds("memory-add").unwrap();
+        cx.simulate_click(bounds.center(), Modifiers::default());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("memory-editor").is_some());
+        assert_eq!(
+            view.read_with(cx, |v, _| v.memory_editor.as_ref().unwrap().revision),
+            0
+        );
+        view.update(cx, |v, cx| v.apply_memory_edit(None, cx));
+        assert!(view.read_with(cx, |v, _| !v.decision_error.is_empty()));
+        view.update(cx, |v, cx| {
+            v.memory_editor = None;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let bounds = cx.debug_bounds("memory-edit").unwrap();
+        cx.simulate_click(bounds.center(), Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(cx, |v, cx| v
+                .memory_editor
+                .as_ref()
+                .unwrap()
+                .content
+                .read(cx)
+                .value()
+                .to_string()),
+            "持续核实根因"
+        );
+        view.update(cx, |v, cx| {
+            v.memory_editor = None;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let bounds = cx.debug_bounds("memory-delete").unwrap();
+        cx.simulate_click(bounds.center(), Modifiers::default());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("memory-delete-confirm").is_some());
+        assert_eq!(
+            view.read_with(cx, |v, _| v.memory_rows.len()),
+            1,
+            "opening delete confirmation cannot delete"
+        );
+        assert_eq!(
+            view.read_with(cx, |v, cx| v.editor.read(cx).value().to_string()),
+            "保留聊天草稿"
+        );
+        cx.simulate_resize(size(px(640.), px(950.)));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("memory-add").is_some());
+    }
+    #[gpui::test]
+    fn memory_layout_bounds_long_chinese_editor_and_summary_refresh(cx: &mut TestAppContext) {
+        let _home = Home::new();
+        cx.update(gpui_shell::init);
+        let long="继续已有任务时优先让原会话接着处理，避免无必要地新开替代会话。核实证据后再同步结果。\n".repeat(24);
+        let (view,cx)=cx.add_window_view(|window,cx| {
+            let mut v=fixture(window,cx);v.config.id=super::super::SUPER_ID.into();v.decision_open=Some(true);v.decision_memory=true;v.memory_records=true;
+            v.memory_rows=vec![json!({"id":"long-note","revision":1,"title":"优先原会话接续","content":long,"sources":[{"id":"human-long","quote":"不要只给我中间结果；已有授权范围内持续推进。".repeat(8)}]})];
+            v.memory_snapshot=json!({"compiled":true,"version":"v1","summary":"Historical context\n\n## Collaboration preferences\n- 优先原会话接续","memories":v.memory_rows});v
+        });
+        cx.simulate_resize(size(px(1200.), px(1400.)));
+        cx.run_until_parked();
+        let title = cx.debug_bounds("memory-card-title").unwrap();
+        let body = cx.debug_bounds("memory-card-body").unwrap();
+        let actions = cx.debug_bounds("memory-card-actions").unwrap();
+        let card = cx.debug_bounds("memory-card").unwrap();
+        assert!(title.bottom() <= body.top(), "title and content overlap");
+        assert!(
+            body.bottom() <= actions.top(),
+            "content and actions overlap: {body:?} {actions:?}"
+        );
+        assert!(actions.bottom() <= card.bottom());
+        let bounds = cx.debug_bounds("memory-edit").unwrap();
+        cx.simulate_click(bounds.center(), Modifiers::default());
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("memory-card").is_none(),
+            "editing must replace the list"
+        );
+        let title = cx.debug_bounds("memory-title-field").unwrap();
+        let content = cx.debug_bounds("memory-content-field").unwrap();
+        let actions = cx.debug_bounds("memory-editor-actions").unwrap();
+        assert!(
+            title.size.height <= px(42.) && title.size.height >= px(38.),
+            "title grew into a blank panel: {title:?}"
+        );
+        assert!(
+            content.size.height >= px(110.) && content.size.height < px(270.),
+            "textarea viewport must remain bounded: {content:?}"
+        );
+        assert!(title.bottom() <= content.top());
+        assert!(content.bottom() <= actions.top(), "editor covers buttons");
+        // Background summary changes never replace the user's active editor.
+        view.update(cx, |v, cx| {
+            v.memory_snapshot["compiled"] = json!(false);
+            v.memory_snapshot["summary"] = json!("## Collaboration preferences\n- 新的当前摘要");
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(cx, |v, cx| v
+                .memory_editor
+                .as_ref()
+                .unwrap()
+                .content
+                .read(cx)
+                .value()
+                .to_string()),
+            long
+        );
+        assert!(
+            view.update_in(cx, |v, w, cx| v.open_memory_view("summary", None, w, cx))
+                .is_err()
+        );
+        cx.simulate_resize(size(px(640.), px(520.)));
+        cx.run_until_parked();
+        let viewport = cx.debug_bounds("decision-list").unwrap();
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position: gpui::point(viewport.right() - px(1.), viewport.center().y),
+            delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(-900.))),
+            ..Default::default()
+        });
+        cx.run_until_parked();
+        assert!(
+            view.read_with(cx, |v, _| v.decision_scroll.offset().y) < px(0.),
+            "small editor must scroll"
+        );
+        view.update(cx, |v, cx| {
+            v.memory_editor = None;
+            v.memory_records = false;
+            v.decision_scroll.set_offset(gpui::point(px(0.), px(0.)));
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("memory-summary-body").is_some());
+        assert!(cx.debug_bounds("memory-card").is_none());
+        assert_eq!(
+            view.read_with(cx, |v, _| v.memory_snapshot.get("compiled").cloned()),
+            Some(json!(false))
+        );
+    }
+    #[gpui::test]
+    fn canonical_goals_tabs_expand_without_touching_composer(cx: &mut TestAppContext) {
+        let _home = Home::new();
+        cx.update(gpui_shell::init);
+        let (view,cx)=cx.add_window_view(|window,cx|{
+            let mut v=fixture(window,cx);v.config.id=super::super::SUPER_ID.into();v.decision_open=Some(true);v.decision_goals=true;
+            v.goal_rows=vec![json!({"id":"fixture-goal","title":"完成STG验收","summary":"第一步已有新证据","next_action":"按既有授权自动继续","phase":"active","enabled":true,"outcome":"STG真实调用通过","mandate":{"scope":"仅STG","exclusions":"不生产发布、不批准工具"}})];
+            v.editor.update(cx,|input,cx|input.set_value("保留未发送草稿",window,cx));v
+        });
+        cx.simulate_resize(size(px(1200.), px(800.)));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("goal-card").is_some());
+        let bounds = cx.debug_bounds("goal-details").unwrap();
+        cx.simulate_click(bounds.center(), Modifiers::default());
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |v, _| v.expanded.contains("goal:fixture-goal")));
+        let bounds = cx.debug_bounds("decision-pending-tab").unwrap();
+        cx.simulate_click(bounds.center(), Modifiers::default());
+        cx.run_until_parked();
+        assert!(!view.read_with(cx, |v, _| v.decision_goals));
+        assert!(cx.debug_bounds("goal-card").is_none());
+        let bounds = cx.debug_bounds("goal-tab").unwrap();
+        cx.simulate_click(bounds.center(), Modifiers::default());
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |v, _| v.decision_goals));
+        assert_eq!(
+            view.read_with(cx, |v, cx| v.editor.read(cx).value().to_string()),
+            "保留未发送草稿"
+        );
+        let bounds = cx.debug_bounds("goal-delete").unwrap();
+        cx.simulate_click(bounds.center(), Modifiers::default());
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |v, _| v.expanded.contains("delete-goal:fixture-goal")));
+        assert_eq!(view.read_with(cx, |v, _| v.goal_rows.len()), 1);
+        let bounds = cx.debug_bounds("goal-delete-cancel").unwrap();
+        cx.simulate_click(bounds.center(), Modifiers::default());
+        cx.run_until_parked();
+        assert!(!view.read_with(cx, |v, _| v.expanded.contains("delete-goal:fixture-goal")));
+        assert_eq!(
+            view.read_with(cx, |v, cx| v.editor.read(cx).value().to_string()),
+            "保留未发送草稿"
+        );
+        cx.simulate_resize(size(px(720.), px(500.)));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("goal-card").is_some());
+    }
+    #[gpui::test]
+    fn working_native_chat_steers_or_queues_without_approving_tools(cx: &mut TestAppContext) {
+        let home = Home::new();
+        cx.update(gpui_shell::init);
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let mut v = fixture(window, cx);
+            v.conversation.status = "working".into();
+            v.conversation.active_turn = "original-turn".into();
+            v.conversation.capabilities.push("steer".into());
+            v.editor
+                .update(cx, |s, cx| s.set_value("改为先检查根因", window, cx));
+            v
+        });
+        let (connection, receiver) = Connection::test_channel(home.path.join("steer-outbox.json"));
+        view.update(cx, |v, _| v.connection = Some(connection));
+        cx.simulate_resize(size(px(1000.), px(800.)));
+        cx.run_until_parked();
+        let send = cx.debug_bounds("chat-send").unwrap();
+        cx.simulate_click(send.center(), Modifiers::default());
+        cx.run_until_parked();
+        let sent = receiver.try_recv().unwrap();
+        assert_eq!(sent["mode"], "steer");
+        assert_eq!(sent["expected_turn"], "original-turn");
+        assert_eq!(sent["text"], "改为先检查根因");
+        view.update_in(cx, |v, window, cx| {
+            v.editor
+                .update(cx, |s, cx| s.set_value("下一轮再做", window, cx));
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let queue = cx.debug_bounds("chat-queue").unwrap();
+        cx.simulate_click(queue.center(), Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(receiver.try_recv().unwrap()["mode"], "queue");
+        view.update_in(cx, |v, window, cx| {
+            v.conversation.apply(
+                &json!({"type":"permission","id":"approval-preserved","name":"Bash","input":{}}),
+            );
+            v.editor
+                .update(cx, |s, cx| s.set_value("先别执行", window, cx));
+            v.send(window, cx);
+            assert_eq!(v.editor.read(cx).value(), "先别执行");
+            assert!(
+                v.conversation
+                    .permissions
+                    .contains_key("approval-preserved")
+            );
+            assert!(
+                v.delegate_mode("change", "delegated-steer-01", "steer", cx)
+                    .is_err()
+            );
+        });
+        assert!(receiver.try_recv().is_err());
+    }
+    #[gpui::test]
+    fn delegated_followup_queues_while_working_without_resolving_approval(cx: &mut TestAppContext) {
+        let home = Home::new();
+        cx.update(gpui_shell::init);
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let v = fixture(window, cx);
+            v.editor
+                .update(cx, |s, cx| s.set_value("保留个人草稿", window, cx));
+            v
+        });
+        let (connection, receiver) =
+            Connection::test_channel(home.path.join("followup-outbox.json"));
+        view.update(cx, |v, cx| {
+            v.connection = Some(connection);
+            v.conversation.status = "working".into();
+            v.conversation
+                .apply(&json!({"type":"permission","id":"keep-approval","name":"Bash","input":{}}));
+            let result = v
+                .delegate_mode(
+                    "After current work, verify the result",
+                    "queued-followup-01",
+                    "queue",
+                    cx,
+                )
+                .unwrap();
+            assert_eq!(result["queued"], true);
+            assert_eq!(result["confirmed"], false);
+            assert!(v.conversation.permissions.contains_key("keep-approval"));
+            assert_eq!(v.editor.read(cx).value(), "保留个人草稿");
+        });
+        let sent = receiver.try_recv().unwrap();
+        assert_eq!(sent["action"], "send");
+        assert_eq!(sent["request_id"], "queued-followup-01");
+        assert!(receiver.try_recv().is_err());
+    }
+    #[gpui::test]
+    fn manual_session_review_queues_once_preserves_draft_and_can_run_again(
+        cx: &mut TestAppContext,
+    ) {
+        let home = Home::new();
+        cx.update(gpui_shell::init);
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let mut v = fixture(window, cx);
+            v.config.id = crate::chat::SUPER_ID.into();
+            v.conversation.capabilities.push("session_review".into());
+            v.editor
+                .update(cx, |s, cx| s.set_value("保持这段草稿", window, cx));
+            v
+        });
+        cx.simulate_resize(size(px(1200.), px(800.)));
+        cx.run_until_parked();
+        let button = cx.debug_bounds("chat-session-review").unwrap();
+        cx.simulate_click(button.center(), Modifiers::default());
+        cx.run_until_parked();
+        assert!(
+            view.read_with(cx, |v, _| v.session_review_id.is_none()),
+            "offline failure must permit retry"
+        );
+        let (connection, receiver) = Connection::test_channel(home.path.join("outbox.json"));
+        view.update(cx, |v, cx| {
+            v.connection = Some(connection);
+            v.conversation.status = "working".into();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let button = cx.debug_bounds("chat-session-review").unwrap();
+        cx.simulate_click(button.center(), Modifiers::default());
+        cx.run_until_parked();
+        let request = receiver.try_recv().unwrap();
+        let id = request["request_id"].as_str().unwrap();
+        assert!(id.starts_with("manual_review_"));
+        assert!(
+            request["text"]
+                .as_str()
+                .unwrap()
+                .contains("inspect_sessions")
+        );
+        assert_eq!(
+            view.read_with(cx, |v, cx| v.editor.read(cx).value().to_string()),
+            "保持这段草稿"
+        );
+        view.update(cx, |v, cx| v.check_sessions(cx));
+        assert!(receiver.try_recv().is_err());
+        view.update(cx, |v, cx| {
+            v.session_review_event(&json!({"type":"review_started","id":id}), cx);
+        });
+        assert!(view.read_with(cx, |v, _| v.session_review_started));
+        view.update(cx, |v, cx| {
+            v.session_review_event(
+                &json!({"type":"review_complete","id":id,"outcome":"completed"}),
+                cx,
+            )
+        });
+        view.update(cx, |v, cx| v.check_sessions(cx));
+        let next = receiver.try_recv().unwrap();
+        assert_ne!(request["request_id"], next["request_id"]);
+        view.update(cx, |v, cx| {
+            v.session_review_event(
+                &json!({"type":"review_complete","id":next["request_id"],"outcome":"error"}),
+                cx,
+            )
+        });
+        assert!(view.read_with(cx, |v, _| v.session_review_id.is_none()));
     }
     #[gpui::test]
     fn decision_reply_is_explicit_durable_deduplicated_and_preserves_main_draft(
@@ -2878,6 +3630,51 @@ mod interaction_tests {
         assert_eq!(
             crate::chat::decisions::read().unwrap()[0]["status"],
             "pending"
+        );
+    }
+    #[gpui::test]
+    fn curation_removes_duplicate_from_inbox_and_keeps_original_in_archive(
+        cx: &mut TestAppContext,
+    ) {
+        let _home = Home::new();
+        let a=crate::chat::decisions::record(&json!({"id":"canonical","title":"Owner's scope choice","context":"A real question","address":"t9","options":["Keep scope","Pause"]})).unwrap();
+        let mut b = a.clone();
+        b["id"] = json!("auto-task-duplicate");
+        b["title"] = json!("Task waiting for same choice");
+        std::fs::write(crate::chat::decisions::path(), json!([a, b]).to_string()).unwrap();
+        cx.update(gpui_shell::init);
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let mut v = fixture(window, cx);
+            v.config.id = crate::chat::SUPER_ID.into();
+            v
+        });
+        cx.simulate_resize(size(px(1200.), px(800.)));
+        cx.run_until_parked();
+        let total = cx.debug_bounds("decision-list").unwrap();
+        assert!(total.size.height > px(0.));
+        crate::chat::decisions::curate(&json!({"action":"merge","id":"canonical","duplicate_ids":["auto-task-duplicate"],"reason":"Same pending choice, original question has the options"})).unwrap();
+        view.update(cx, |v, cx| {
+            v.decision_rows = crate::chat::decisions::read().unwrap();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(cx, |v, _| v
+                .decision_rows
+                .iter()
+                .filter(|r| crate::chat::decisions::needs_attention(r))
+                .count()),
+            1
+        );
+        assert!(cx.debug_bounds("decision-submit").is_some());
+        let tab = cx.debug_bounds("decision-done-tab").unwrap();
+        cx.simulate_click(tab.center(), Modifiers::default());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("decision-card").is_some());
+        assert!(cx.debug_bounds("decision-submit").is_none());
+        assert!(
+            cx.debug_bounds("decision-complete").is_none(),
+            "merged duplicate must not reopen as a new pending question"
         );
     }
     #[gpui::test]

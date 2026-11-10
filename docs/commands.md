@@ -65,7 +65,7 @@ No arguments.
 
 ## `supervisor.decision`
 
-Upsert an observational decision card. Stable ID deduplicates; human answers and completion are preserved. Never dispatches work or grants approval.
+Upsert an explicitly agent-selected decision card. Stable ID deduplicates; human answers and completion are preserved. Never dispatches work or grants approval.
 
 | Argument | Required |
 |---|---|
@@ -75,6 +75,21 @@ Upsert an observational decision card. Stable ID deduplicates; human answers and
 | `address` | yes |
 | `options` | no |
 | `evidence` | no |
+| `decision_key` | no |
+| `reason` | no |
+| `source_ids` | no |
+| `distinct_from` | no |
+
+## `supervisor.decision_curate`
+
+Merge duplicate pending cards or withdraw an obsolete pending card. Retains archived originals and never accepts work or modifies answered/completed cards.
+
+| Argument | Required |
+|---|---|
+| `action` | yes |
+| `id` | yes |
+| `reason` | yes |
+| `duplicate_ids` | no |
 
 ## `supervisor.close`
 
@@ -100,13 +115,14 @@ Read native history without changing focus or unread status.
 
 ## `supervisor.send`
 
-Queue an assignment to an idle native session without editing its draft.
+Send a native follow-up: queue after current work, or steer its verified active turn. Preserves drafts and pending approvals.
 
 | Argument | Required |
 |---|---|
 | `address` | yes |
 | `text` | yes |
 | `request_id` | yes |
+| `mode` | no |
 
 ## `supervisor.create`
 
@@ -131,6 +147,16 @@ Open a native Claude conversation executed on an SSH machine. Input, history and
 | `model` | no |
 | `resume` | no |
 | `space` | no |
+
+## `chat.memory`
+
+Open Super Agent memory summary, records, new or edit view. Navigation only; never saves or deletes. Preserves unsaved memory edits.
+
+| Argument | Required |
+|---|---|
+| `pane` | no |
+| `view` | no |
+| `id` | no |
 
 ## `chat.status`
 

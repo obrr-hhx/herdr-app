@@ -51,7 +51,7 @@ test('agent chooses a specific follow-up time, then may wait indefinitely; human
  assert.equal(planCheckin({snapshot:{...snapshot,at:now+1440*minute},events:[...es,waiting],state,now:now+1440*minute}),null);
  assert(planCheckin({snapshot:{...snapshot,at:now+20*minute,sessions:[{...worker,completion:2}]},events:[...es,waiting],state,now:now+20*minute}));
  assert(planCheckin({snapshot:{...snapshot,at:now+20*minute},events:[...es,waiting,{type:'user',id:'new-human',time:now+minute}],state,now:now+20*minute}));
- assert(readOnlyTool('plan_followup'));assert(readOnlyTool('record_decision'));assert(readOnlyTool('list_decisions'));assert(!readOnlyTool('resolve_decision'));
+ assert(readOnlyTool('plan_followup'));assert(readOnlyTool('record_decision'));assert(readOnlyTool('curate_decision'));assert(readOnlyTool('list_decisions'));assert(!readOnlyTool('resolve_decision'));
 });
 test('late decisions retain the original human basis; invalid plans are rejected and view-only Done changes do not count as evidence',()=>{
  const obs={type:'observation',id:'observe_checkin_first',time:now};const es=[...events,obs,{type:'user',id:'new-human',time:now+1}];
@@ -69,4 +69,19 @@ test('legacy fixed-interval state gets one adaptive decision instead of becoming
  const legacy={last_digest:fingerprint(snapshot),last_human_id:'human',last_queued_at:now-31*minute};
  const bootstrap=planCheckin({snapshot,events,state:legacy,now});assert(bootstrap);assert.equal(bootstrap.next.schema_version,2);
  assert.equal(planCheckin({snapshot:{...snapshot,at:now+60*minute},events,state:bootstrap.next,now:now+60*minute}),null);
+});
+
+test('background goals use only bounded continuation and manual review stays observational',async()=>{const {readOnlyTurn,readOnlyTool}=await import('./checkins.mjs');assert(readOnlyTurn('observe_session_result'));assert(readOnlyTool('advance_goal','observe_checkin_qa'));assert(!readOnlyTool('advance_goal','manual_review_qa'));assert(readOnlyTool('record_goal_progress','observe_result'));for(const name of ['send_message','create_session','reply_to_question','close_session','release_session'])assert(!readOnlyTool(name,'observe_result'));});
+
+test('unfinished goals have a periodic review even after adaptive wait and unchanged sessions',async()=>{
+ const {planCheckin,followupPlan}=await import('./checkins.mjs');const now=Date.now();
+ const snapshot={at:now,sessions:[],goals:[{id:'goal',phase:'active',enabled:true}]};
+ const events=[{type:'user',id:'human',time:now-7200000},{type:'followup_plan',observation_id:'old',mode:'wait',basis_human_id:'human',time:now-7100000}];
+ const plan=planCheckin({snapshot,events,state:{started_at:now-7200000},now});assert.equal(plan.event.kind,'goal_review');assert.equal(plan.event.mandatory_report,true);assert.deepEqual(plan.event.goal_ids,['goal']);
+ const observed=[...events,{type:'observation',id:plan.id,time:now,events:[plan.event]}];
+ assert.throws(()=>followupPlan(snapshot,observed,plan.id,{after_minutes:null,publish:false,reason:'nothing changed'},now),/must publish/);
+ assert.equal(followupPlan(snapshot,observed,plan.id,{after_minutes:null,publish:true,reason:'verified goal blockers'},now).mode,'wait');
+ assert.equal(planCheckin({snapshot,events:[...observed,{type:'goal_review_complete',id:plan.id,time:now}],state:plan.next,now}),null);
+ assert.equal(planCheckin({snapshot:{...snapshot,at:now+3600001},events:[...observed,{type:'goal_review_complete',id:plan.id,time:now}],state:plan.next,now:now+3600001}).event.kind,'goal_review');
+ assert.equal(planCheckin({snapshot,events,state:{started_at:now-7200000},config:{enabled:false},now}),null);
 });

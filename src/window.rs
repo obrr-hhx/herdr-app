@@ -1708,7 +1708,7 @@ impl AppWindow {
                         let mut program=crate::programs::of(Some("claude-code"),&[]);
                         if chat.id==crate::chat::SUPER_ID {program["name"]=json!("Super Agent");program["icon"]=json!("mods/agents/super.svg");program["tint"]=json!(true);}
                         panes.push(json!({"pane":p.id,"terminal":null,"mod":"claude-chat","tab":ctx.id,"title":Model::tab_name(pr,ctx),"status":status,"app":"claude-code","program":program,"focused":focused,"zoomed":zoomed,"movable":self.pane_movable(&p.id)}));
-                        if let Some(status)=status {agents.push(json!({"address":address,"pane":p.id,"space":pr.id,"space_name":m.space_name(pr,&home),"tab":ctx.id,"tab_index":ci+1,"tab_name":Model::tab_name(pr,ctx),"status":status,"app":"claude-code","program":program,"title":Model::tab_name(pr,ctx),"seq":m.agents.get(&address).map(|a|a.seq).unwrap_or(0),"pinned":false,"pinnable":false,"focused":focused,"host":chat.host,"folder":chat.folder,"conversation":chat.id,"super_agent":chat.id==crate::chat::SUPER_ID,"completion":self.chats.get(&p.id).map(|v|v.read(cx).completion()),"attention":self.chats.get(&p.id).map(|v|v.read(cx).attention_token()),"detail":self.chats.get(&p.id).map(|v|v.read(cx).agent_detail().to_owned())}));}
+                        if let Some(status)=status {agents.push(json!({"address":address,"pane":p.id,"space":pr.id,"space_name":m.space_name(pr,&home),"tab":ctx.id,"tab_index":ci+1,"tab_name":Model::tab_name(pr,ctx),"status":status,"app":"claude-code","program":program,"title":Model::tab_name(pr,ctx),"seq":m.agents.get(&address).map(|a|a.seq).unwrap_or(0),"pinned":false,"pinnable":false,"focused":focused,"host":chat.host,"folder":chat.folder,"conversation":chat.id,"super_agent":chat.id==crate::chat::SUPER_ID,"completion":self.chats.get(&p.id).map(|v|v.read(cx).completion()),"attention":self.chats.get(&p.id).map(|v|v.read(cx).attention_token()),"steer_available":self.chats.get(&p.id).is_some_and(|v|v.read(cx).can_steer()),"detail":self.chats.get(&p.id).map(|v|v.read(cx).agent_detail().to_owned())}));}
                         continue;
                     }
                     let Some(addr) = p.terminal() else { continue };
@@ -2874,6 +2874,9 @@ impl AppWindow {
             "supervisor.decision" => {
                 match crate::chat::decisions::record(a) { Ok(row) => self.answer(Ok(row)), Err(e) => self.fail(e) }
             }
+            "supervisor.decision_curate" => {
+                match crate::chat::decisions::curate(a) { Ok(row) => self.answer(Ok(row)), Err(e) => self.fail(e) }
+            }
             "supervisor.close" => {
                 let address=Self::arg(a,"address").unwrap_or_default();let request=Self::arg(a,"request_id").unwrap_or_default();
                 if a["confirmed"]!=true{return self.fail("Close needs explicit user authorization: confirmed must be true");}
@@ -2930,7 +2933,7 @@ impl AppWindow {
                 } else {
                     let text=Self::arg(a,"text").unwrap_or_default();let id=Self::arg(a,"request_id").unwrap_or_default();
                     if !(8..=100).contains(&id.len()) || !id.bytes().all(|b|b.is_ascii_alphanumeric()||b"_-".contains(&b)){return self.fail("Invalid request ID");}
-                    let result=view.update(cx,|v,cx|v.delegate(text,id,cx));self.answer(result);
+                    let result=view.update(cx,|v,cx|v.delegate_mode(text,id,Self::arg(a,"mode").unwrap_or("queue"),cx));self.answer(result);
                 }
             }
             "supervisor.create" => {
@@ -2940,8 +2943,9 @@ impl AppWindow {
                 let title=Self::arg(a,"title").unwrap_or("Worker");let agent=Self::arg(a,"agent").unwrap_or("claude");
                 let before=self.model.active.clone();
                 if agent=="claude" {
-                    let known=host=="@local"||self.model.spaces.iter().flat_map(|s|s.tabs.iter()).flat_map(|t|t.root.panes()).any(|p|matches!(p.content(),Some(Content::Chat{chat}) if chat.host==host));
-                    if !known{return self.fail("Choose an existing native SSH host from list_sessions");}
+                    // The manager validates registered SSH aliases. The window uses
+                    // the same address syntax as chat.open, including first workers.
+                    if !crate::chat::valid_host(host){return self.fail("Choose a valid SSH host");}
                     self.dispatch("chat.open",&json!({"host":host,"folder":folder,"title":title}),person,window,cx);
                 } else if agent=="codex" {
                     let machine=(host!="@local").then_some(host.to_owned());
@@ -3081,6 +3085,13 @@ impl AppWindow {
                 self.model.active = Some(space.clone());
                 self.sync(window, cx);
                 self.answer(Ok(json!({"space":space,"tab":tab,"pane":pane})));
+            }
+            "chat.memory" => {
+                let pane=Self::owned(a,"pane").or_else(||self.model.focused_pane());
+                if let Some(view)=pane.as_ref().and_then(|id|self.chats.get(id)).cloned() {
+                    let result=view.update(cx,|view,cx|view.open_memory_view(Self::arg(a,"view").unwrap_or("summary"),Self::arg(a,"id"),window,cx));
+                    match result {Ok(())=>self.answer(Ok(view.read(cx).status(cx))),Err(e)=>self.fail(e)}
+                } else {self.fail("请先打开 Super Agent");}
             }
             "chat.status" | "chat.send" => {
                 let pane = Self::owned(a, "pane").or_else(|| self.model.focused_pane());

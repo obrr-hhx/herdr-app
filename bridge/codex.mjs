@@ -1,5 +1,6 @@
+import {memoryAdditionalContext} from './memory_context.mjs';
 // Codex's supported app-server protocol; no TUI parsing and no exec/print mode.
-import {checkinId,readOnlyTool} from './checkins.mjs';
+import {readOnlyTurn,readOnlyTool} from './checkins.mjs';
 import crypto from 'node:crypto';import fs from 'node:fs';import path from 'node:path';import readline from 'node:readline';import {spawn} from 'node:child_process';import {EventEmitter} from 'node:events';import {fileURLToPath} from 'node:url';
 export function errorLabel(info){
  const allowed=['contextWindowExceeded','sessionBudgetExceeded','usageLimitExceeded','rateLimitExceeded','flexUnavailable','serverOverloaded','modelNotFound','policyCapacityUnavailable','cyberPolicy','misalignmentPolicyViolation','tooManyDenials','internalServerError','unauthorized','badRequest','threadRollbackFailed','sandboxError','other'];
@@ -26,7 +27,7 @@ export function codexRunner(folder,cwd,callbacks,settings={}){
   if(c.action!=='send')return;
   command=c;
   const input=[...(c.text?[{type:'text',text:c.text}]:[]),...(c.image_paths??[]).map(p=>({type:'localImage',path:p}))];
-  rpc('turn/start',{threadId:thread,input,clientUserMessageId:c.request_id,environments:[],...(settings.model&&settings.model!=='default'?{model:settings.model}:{}),effort:settings.effort||models.find(m=>m.model===settings.model)?.defaultReasoningEffort||null}).then(r=>{turn=r.turn.id;callbacks.confirmed(c.request_id);}).catch(()=>{if(closed)return;command=null;callbacks.failure('Codex did not confirm this turn. Inspect the conversation before retrying.');});
+  rpc('turn/start',{threadId:thread,input,...(Object.hasOwn(c,'memory_snapshot')?{additionalContext:memoryAdditionalContext(c.memory_snapshot)}:{}),clientUserMessageId:c.request_id,environments:[],...(settings.model&&settings.model!=='default'?{model:settings.model}:{}),effort:settings.effort||models.find(m=>m.model===settings.model)?.defaultReasoningEffort||null}).then(r=>{turn=r.turn.id;callbacks.confirmed(c.request_id);}).catch(()=>{if(closed)return;command=null;callbacks.failure('Codex did not confirm this turn. Inspect the conversation before retrying.');});
  }};
  const pieces=new Map();
  readline.createInterface({input:app.stdout}).on('line',async line=>{
@@ -34,7 +35,7 @@ export function codexRunner(folder,cwd,callbacks,settings={}){
   if(m.id!==undefined&&pending.has(m.id)&&!m.method){const p=pending.get(m.id);pending.delete(m.id);clearTimeout(p.timer);m.error?p.reject(Error('app_server_error')):p.resolve(m.result);return;}
   if(m.method==='item/tool/call'&&m.id!==undefined){
    try{
-    if(checkinId(command?.request_id)&&!readOnlyTool(m.params.tool)){write({id:m.id,result:{contentItems:[{type:'inputText',text:'Periodic check-ins are read-only; wait for explicit human authority.'}],success:false}});return;}
+    if(readOnlyTurn(command?.request_id)&&!readOnlyTool(m.params.tool,command?.request_id)){write({id:m.id,result:{contentItems:[{type:'inputText',text:'Session inspections are read-only; wait for explicit human authority.'}],success:false}});return;}
     callbacks.tool(m.params.callId,m.params.tool,m.params.arguments);
     const result=await toolProcess(['--call',m.params.tool,JSON.stringify(m.params.arguments)]);
     callbacks.toolResult(m.params.callId,result.value,!result.ok);
