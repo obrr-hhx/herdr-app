@@ -704,6 +704,8 @@ pub fn edit_memory(home: &Path, args: &Value) -> Result<Vec<Value>, String> {
         std::fs::write(runtime.join(name), source).map_err(|_| "无法准备记忆存储".to_owned())?;
     }
     let mut child = std::process::Command::new("python3")
+        // JSON crosses a pipe; Windows' locale encoding cannot represent memory text.
+        .env("PYTHONIOENCODING", "utf-8")
         .arg(runtime.join("memory_store.py"))
         .arg("--manual")
         .arg(home)
@@ -744,6 +746,7 @@ pub fn delete_goal(home: &Path, id: &str, revision: u64) -> Result<Vec<Value>, S
         std::fs::write(runtime.join(name), source).map_err(|e| e.to_string())?;
     }
     let mut child = std::process::Command::new("python3")
+        .env("PYTHONIOENCODING", "utf-8")
         .arg(runtime.join("goal_store.py"))
         .arg("--delete-manual")
         .arg(home)

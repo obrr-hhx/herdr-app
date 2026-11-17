@@ -37,7 +37,7 @@ const manager=process.env.HERDR_SUPER_AGENT==='1';
 let claudeMemoryVersion=null;
 if(manager&&!runtime.provider)runtime={model:'default',effort:'',provider:'codex'};
 let reminderClock=null,codexWorkers=null,checkinClock=null,memoryClock=null,checkinDecision=null,checkinOutput=[];
-const emit=(type,data={})=>{if(memoryTurn(turnRequestId)&&['delta','message_complete','tool','tool_result'].includes(type))return null;if(checkinId(turnRequestId)&&['delta','message_complete','tool','tool_result'].includes(type)){if(checkinDecision?.publish===false)return null;if(!checkinDecision){checkinOutput.push([type,data]);return null;}}const e=journal.append(type,data),line=JSON.stringify(e)+'\n';for(const p of peers){if(p.writableLength>8*1024*1024)p.destroy();else p.write(line);}return e;};
+const emit=(type,data={})=>{if(memoryTurn(turnRequestId)&&['delta','message_complete','tool','tool_result'].includes(type))return null;if(turnRequestId?.startsWith('observe_')&&['delta','message_complete','tool','tool_result'].includes(type)){if(checkinDecision?.publish===false)return null;if(!checkinDecision){checkinOutput.push([type,data]);return null;}}const e=journal.append(type,data),line=JSON.stringify(e)+'\n';for(const p of peers){if(p.writableLength>8*1024*1024)p.destroy();else p.write(line);}return e;};
 if(existing)emit('state',{status:'interrupted',message:'Service restarted. Previously accepted prompts were not automatically submitted again.'});
 if(existing)finishReviews('interrupted');
 if(existing)for(const id of unconfirmedSteering(journal.events))emit('dispatch_receipt',{id,mode:'steer',stage:'unknown',reason:'Bridge restarted before Claude confirmed this input. Inspect the same session; it was not replayed.'});
@@ -61,13 +61,14 @@ function capabilities(){return ['workspace','settings','compact','images',...(!m
 function activity(){return {active_turn:turnRequestId,phase,last_progress:lastProgress,tool:lastTool,permission_mode:manager?'managementTools':permissionMode};}
 function progress(next,tool=''){lastProgress=Date.now();phase=next;lastTool=tool;}
 function finishReviews(outcome){for(const e of journal.events.filter(e=>e.type==='review_requested'))if(!journal.events.some(r=>r.type==='review_complete'&&r.id===e.id))emit('review_complete',{id:e.id,outcome});}
-function state(s){status=s;if(['error','interrupted','interrupting'].includes(s))finishReviews(s);if(s!=='working')progress(s);if((memoryTurn(turnRequestId)||checkinId(turnRequestId)&&!checkinDecision?.publish)&&s==='working')return;emit('state',{status:s,active_turn:turnRequestId});}
+function state(s){status=s;if(['error','interrupted','interrupting'].includes(s))finishReviews(s);if(s!=='working')progress(s);if((memoryTurn(turnRequestId)||turnRequestId?.startsWith('observe_')&&!checkinDecision?.publish)&&s==='working')return;emit('state',{status:s,active_turn:turnRequestId});}
 const activityTimer=setInterval(()=>{for(const p of peers)if(p.writableLength<1024*1024)p.write(JSON.stringify({type:'activity',...activity()})+'\n');},5000);activityTimer.unref();
 function cancelPermissions(){for(const [id,p]of pending){p.reply('deny');clearTimeout(p.timer);emit('permission_resolved',{id,decision:'cancelled'});}pending.clear();}
 function dispatch(){if(!cli||!ready||busy||!queue.length)return;while(queue.length&&(!checkinStillValid(process.env.HERDR_APP_HOME??'',journal,queue[0])||memoryTurn(queue[0].request_id)&&journal.events.some(e=>e.type==='user'&&e.time>(journal.events.findLast(v=>v.type==='observation'&&v.id===queue[0].request_id)?.time??0)))){const skipped=queue.shift();emit('observation_complete',{id:skipped.request_id,skipped:'newer_human_or_disabled'});}if(!queue.length)return;current=queue.shift();turnRequestId=current.request_id;if(manualReviewId(turnRequestId))emit('review_started',{id:turnRequestId});checkinDecision=null;checkinOutput=[];goalReviewTools.clear();busy=true;progress('submitting');state('working');if(manager){const dir=path.join(process.env.HERDR_APP_HOME,'data/super-agent');fs.mkdirSync(dir,{recursive:true});fs.writeFileSync(path.join(dir,'active-observation.json'),JSON.stringify({id:turnRequestId,socket:folder+'/run.sock',cursor:journal.events.length}),{mode:0o600});}if(manager)current.memory_snapshot=memorySnapshot(process.env.HERDR_APP_HOME);cli.stdin.write(JSON.stringify({...current,action:'send',image_paths:imagePaths(folder,current.images)})+'\n');}
 function commitFollowup(args,allowGap=false){
  if(isGoalReview(turnRequestId)&&!allowGap&&(!goalReviewTools.has('list_goals')||!['inspect_sessions','read_session'].some(t=>goalReviewTools.has(t))))throw Error('Before publishing a goal review, read list_goals and attempt fresh inspect_sessions/read_session evidence. Report any observation gaps explicitly.');
  let snapshot={sessions:[]};try{snapshot=JSON.parse(fs.readFileSync(path.join(process.env.HERDR_APP_HOME,'data/super-agent/sessions.json'),'utf8'));}catch{}
+ try{snapshot.goals=JSON.parse(fs.readFileSync(path.join(process.env.HERDR_APP_HOME,'data/super-agent/goals.json'),'utf8')).goals??[];}catch{}
  const plan=followupPlan(snapshot,journal.events,turnRequestId,args);
  const recorded=emit('followup_plan',plan);checkinDecision=recorded;if(checkinId(turnRequestId)&&plan.publish)emit('state',{status:'working'});
  const buffered=checkinOutput;checkinOutput=[];if(plan.publish)for(const [type,data]of buffered)emit(type,data);
@@ -75,7 +76,7 @@ function commitFollowup(args,allowGap=false){
 }
 function isGoalReview(id){return journal.events.some(e=>e.type==='observation'&&e.id===id&&e.events?.some(v=>v.kind==='goal_review'));}
 function completeObservation(){if(memoryTurn(turnRequestId)){emit('observation_complete',{id:turnRequestId});turnRequestId=null;checkinOutput=[];return;}if(manualReviewId(turnRequestId))emit('review_complete',{id:turnRequestId,outcome:'completed'});if(turnRequestId?.startsWith('observe_')){
- if(!journal.events.some(e=>e.type==='followup_plan'&&e.observation_id===turnRequestId)){const required=isGoalReview(turnRequestId);if(required)checkinOutput.push(['delta',{id:'goal-review-gap-'+turnRequestId,index:0,kind:'text_delta',text:'本轮目标检查未提交完整核验结论；以上内容可能不完整，不能视为目标已完成。未完成目标会继续定期复查。'}]);commitFollowup({after_minutes:null,publish:required,reason:required?'Goal review ended without an explicit checked report; publish the observation gap and retain the next mandatory review.':'No explicit follow-up decision was produced; wait for the human or new evidence instead of repeating automatically.'},true);}
+ if(!journal.events.some(e=>e.type==='followup_plan'&&e.observation_id===turnRequestId)){const required=isGoalReview(turnRequestId);commitFollowup({after_minutes:null,publish:false,reason:required?'Goal review lacked an explicit report decision; remain silent and retain the next internal review.':'No explicit follow-up decision was produced; wait for the human or new evidence instead of repeating automatically.'},true);}
  if(isGoalReview(turnRequestId))emit('goal_review_complete',{id:turnRequestId});
  emit('observation_complete',{id:turnRequestId});if(checkinId(turnRequestId)){emit('checkin_complete',{id:turnRequestId,published:checkinDecision?.publish===true});if(checkinDecision?.publish&&checkinStillValid(process.env.HERDR_APP_HOME,journal,{request_id:turnRequestId}))notifyCheckin(process.env.HERDR_APP_HOME,turnRequestId);}}
  turnRequestId=null;checkinOutput=[];
@@ -168,7 +169,7 @@ const server=net.createServer(socket=>{
    if(c.action==='subscribe'){
      if(!Number.isSafeInteger(c.after)||c.after<0||c.after>journal.events.length)throw Error('cursor');
      for(const e of journal.after(c.after))socket.write(JSON.stringify(e)+'\n');peers.add(socket);subscribed=true;
-     socket.write(JSON.stringify({type:'connected',bridge_protocol:2,status:memoryTurn(turnRequestId)||checkinId(turnRequestId)&&!checkinDecision?.publish?'idle':status,head:journal.events.length,pending:[...pending.keys(),...(codexWorkers?.ids()??[])],...activity(),capabilities:capabilities()})+'\n');return;
+     socket.write(JSON.stringify({type:'connected',bridge_protocol:2,status:memoryTurn(turnRequestId)||turnRequestId?.startsWith('observe_')&&!checkinDecision?.publish?'idle':status,head:journal.events.length,pending:[...pending.keys(),...(codexWorkers?.ids()??[])],...activity(),capabilities:capabilities()})+'\n');return;
    }
    if(!subscribed||typeof c.request_id!=='string'||! /^[a-zA-Z0-9_-]{8,100}$/.test(c.request_id))throw Error('invalid_command');
    if(c.action==='plan_followup'&&manager){

@@ -10,6 +10,28 @@ class Goals(unittest.TestCase):
   self.sessions=[{'address':'chat:p','conversation':'original','host':'qa'}]
   self.args={'id':'goal-qa','expected_revision':0,'title':'端到端目标','outcome':'完成STG验收','task_ids':['old-task'],'enabled':True,'mandate':{'source_ids':['human-grant'],'actions':['test'],'scope':'仅STG验证','exclusions':'不合并、不生产发布、不批准工具'},'plan':[{'id':'verify','address':'chat:p','action':'test','instruction':'接续原验证','postcondition':'返回验证证据','depends_on':['ready']}],'summary':'等待前置条件','next_action':'确认ready'}
   self.goal=g.save(self.home,self.args,self.sessions)
+ def test_delivery_result_and_bounded_followup_end_to_end(self):
+  self.proof();sent=[];args={'goal_id':'goal-qa','step_id':'verify'}
+  receipt=g.advance(self.home,args,self.sessions,lambda a:sent.append(a) or {'queued':True})
+  self.assertFalse(receipt['confirmed'])
+  folder=self.home/'data/forge-chat/original';folder.mkdir();journal=folder/'events.jsonl'
+  events=[{'type':'prompt_confirmed','id':receipt['request_id']},{'type':'message_complete','id':'actual-result'}]
+  journal.write_text(''.join(json.dumps(e)+'\n' for e in events))
+  checked=g.reconcile(self.home,self.sessions)['goals'][0];self.assertEqual(checked['steps_receipts'][0]['result_state'],'running')
+  follow={'goal_id':'goal-qa','expected_revision':checked['revision'],'after_step_id':'verify','step_id':'next','action':'test','instruction':'核对剩余STG测试','postcondition':'返回STG验证结果'}
+  with self.assertRaisesRegex(ValueError,'actual predecessor'):g.plan_followup(self.home,follow,self.sessions)
+  events.append({'type':'state','status':'idle'});journal.write_text(''.join(json.dumps(e)+'\n' for e in events));checked=g.reconcile(self.home,self.sessions)['goals'][0]
+  self.assertEqual(checked['steps_receipts'][0]['result_ids'],['actual-result'])
+  with self.assertRaisesRegex(ValueError,'Outside'):g.plan_followup(self.home,{**follow,'action':'deploy_prd'},self.sessions)
+  with self.assertRaisesRegex(ValueError,'identity'):g.plan_followup(self.home,follow,[{**self.sessions[0],'conversation':'replacement'}])
+  after=g.plan_followup(self.home,follow,self.sessions);self.assertEqual(after['mandate'],checked['mandate'])
+  g.advance(self.home,{'goal_id':'goal-qa','step_id':'next'},self.sessions,lambda a:sent.append(a) or {'queued':True})
+  g.advance(self.home,{'goal_id':'goal-qa','step_id':'next'},self.sessions,lambda a:self.fail('duplicate send'))
+  self.assertEqual(len(sent),2);self.assertIn('不合并、不生产发布、不批准工具',sent[-1]['text'])
+ def test_unrelated_later_turn_never_satisfies_a_queued_assignment(self):
+  target=self.sessions[0];a={'address':target['address'],'request_id':'direct-assignment'};g.track_assignment(self.home,a,target,{'queued':True})
+  folder=self.home/'data/forge-chat/original';folder.mkdir();es=[{'type':'prompt_confirmed','id':'direct-assignment'},{'type':'prompt_confirmed','id':'another-turn'},{'type':'message_complete','id':'unrelated-result'},{'type':'state','status':'idle'}];(folder/'events.jsonl').write_text(''.join(json.dumps(e)+'\n' for e in es))
+  g.reconcile(self.home,self.sessions);self.assertNotEqual(g.assignments(self.home)[0].get('result_state'),'result_available')
  def test_delete_keeps_evidence_and_prevents_background_resurrection(self):
   self.proof();g.advance(self.home,{'goal_id':'goal-qa','step_id':'verify'},self.sessions,lambda a:{'queued':True})
   goal=g.snapshot(self.home)['goals'][0]

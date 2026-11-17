@@ -688,14 +688,16 @@ Source quotes expand inside their own cards. The `chat.memory` navigation comman
 opens summary/records/new/edit views without mutating data or discarding drafts.
 
 ## Periodic goal tracking
-Unfinished goals receive a mandatory published review every `goal_review_minutes`
-(default 60). This backstop runs independently of adaptive wait decisions, human
-silence and unchanged terminal status. The manager reads canonical goals, attempts
-fresh source evidence, updates verified progress and advances only stored authorized
-steps. Reports explain completed outcomes, blockers, actual advancement and next
-steps. Missing evidence is explicit; skipped final review produces an incomplete
-check notice. Busy turns defer, missed intervals coalesce, and reporting disabled
-or paused goals stop the backstop. Earlier adaptive follow-ups remain available.
+Goal progress is checked internally every `goal_review_minutes` (default 60), even
+when notifications wait. Unchanged evidence, age counters and revisions stay silent;
+only material changes are published, with persistent evidence deduplication across
+restarts. Failed/incomplete checks are retained as observation gaps, never completion.
+`list_sessions.assignments` tracks queued input through confirmed receipt and actual
+worker result; idle alone is not a result. The manager reads and explains results
+here, rather than making the person open workers. `plan_goal_followup` may append
+one next step after a verified predecessor result, using the same worker and unchanged
+mandate/actions/scope/exclusions. Paused/deleted/human-blocked goals cannot advance;
+unknown delivery is never replayed. Busy turns defer and missed reviews coalesce.
 
 Goal worker follow-up: a bound original worker quiet for 15 minutes generates a
 `goal_session_quiet` observation. `ask_goal_session` verifies fresh identity,

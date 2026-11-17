@@ -42,6 +42,7 @@ else {emit({method:'item/agentMessage/delta',params:{threadId:'goal-thread',item
    let all=[];for(let i=0;i<350;i++){await delay(30);all=fs.readFileSync(folder+'/events.jsonl','utf8').trim().split('\n').map(JSON.parse);if(all.some(e=>e.type==='observation_complete'&&e.id==='observe_checkin_goal_run_'+run))break;}
    assert(all.some(e=>e.type==='observation_complete'&&e.id==='observe_checkin_goal_run_'+run),'background goal turn did not complete');
    assert(all.some(e=>e.type==='goal_review_complete'&&e.id==='observe_checkin_goal_run_'+run));assert(all.some(e=>e.type==='followup_plan'&&e.publish===true));assert(all.some(e=>e.type==='delta'&&e.text.includes('目标已自动接续')));assert(all.some(e=>e.type==='tool_result'&&e.is_error&&JSON.stringify(e.content).includes('Background turns')));
+   const currentPlan=all.find(e=>e.type==='followup_plan'&&e.observation_id==='observe_checkin_goal_run_'+run);assert(currentPlan);assert.equal(currentPlan.publish,run===0,'unchanged goal review after restart must stay silent');
    child.kill('SIGTERM');await new Promise(r=>child.once('exit',r));child=null;
   }
   const dispatches=fs.readFileSync(home+'/data/forge-chat/qa-worker/dispatches.jsonl','utf8').trim().split('\n').map(JSON.parse);assert.equal(dispatches.length,1);assert(dispatches[0].text.includes('不生产发布、不批准工具'));

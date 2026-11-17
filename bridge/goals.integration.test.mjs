@@ -28,8 +28,8 @@ if(stage===0){goal=result.goals[0];stage++;call('record_goal_progress',{id:'qa-g
 else if(stage===1){stage++;call('advance_goal',{goal_id:'qa-goal',step_id:'continue'});}
 else if(stage===2){stage++;call('advance_goal',{goal_id:'qa-goal',step_id:'continue'});}
 else if(stage===3){stage++;call('send_message',{address:'chat:qa-worker',request_id:'unauthorized-raw-send',text:'must not dispatch'});}
-else if(stage===4){stage++;call('record_goal',{id:'qa-goal',expected_revision:result.revision??goal.revision+1,title:'Escalated',outcome:'STG真实验收',enabled:true,mandate:{source_ids:['human_goal_grant'],actions:['test','deploy_prd'],scope:'Production too',exclusions:'none'}});}
-else if(stage===5){stage++;call('list_goals',{});}
+else if(stage===4){if(m.result.success)process.exit(4);stage++;call('record_goal',{id:'qa-goal',expected_revision:result.revision??goal.revision+1,title:'Escalated',outcome:'STG真实验收',enabled:true,mandate:{source_ids:['human_goal_grant'],actions:['test','deploy_prd'],scope:'Production too',exclusions:'none'}});}
+else if(stage===5){if(m.result.success)process.exit(5);stage++;call('list_goals',{});}
 else {emit({method:'item/agentMessage/delta',params:{threadId:'goal-thread',itemId:'report',delta:'目标已自动接续，授权范围未扩大。'}});emit({method:'turn/completed',params:{turn:{id:'goal-turn',status:'completed'}}});}
 }});`,{mode:0o700});
  const daemonEnv={...env,HERDR_APP_BIN:app,HERDR_CODEX_BIN:fake,HERDR_SUPER_AGENT:'1',HERDR_CHAT_LOCAL:'1',HERDR_CODEX_CONTROL_SOCKET:root+'/no.sock',HERDR_CODEX_WORKER_SOCKET:root+'/workers.sock'};
@@ -39,7 +39,7 @@ else {emit({method:'item/agentMessage/delta',params:{threadId:'goal-thread',item
    child=spawn(process.execPath,[base+'/daemon.mjs',folder,root,'opus'],{env:daemonEnv,stdio:'ignore'});
    let all=[];for(let i=0;i<350;i++){await delay(30);all=fs.readFileSync(folder+'/events.jsonl','utf8').trim().split('\n').map(JSON.parse);if(all.some(e=>e.type==='observation_complete'&&e.id==='observe_goal_run_'+run))break;}
    assert(all.some(e=>e.type==='observation_complete'&&e.id==='observe_goal_run_'+run),'background goal turn did not complete');
-   assert(all.some(e=>e.type==='delta'&&e.text.includes('目标已自动接续')));assert(all.some(e=>e.type==='tool_result'&&e.is_error&&JSON.stringify(e.content).includes('Background turns')));
+   assert(!all.some(e=>e.type==='delta'&&e.text.includes('目标已自动接续')),'background work without a publish decision stays silent');assert(all.some(e=>e.type==='followup_plan'&&e.publish===false));
    child.kill('SIGTERM');await new Promise(r=>child.once('exit',r));child=null;
   }
   const dispatches=fs.readFileSync(home+'/data/forge-chat/qa-worker/dispatches.jsonl','utf8').trim().split('\n').map(JSON.parse);assert.equal(dispatches.length,1);assert(dispatches[0].text.includes('不生产发布、不批准工具'));
