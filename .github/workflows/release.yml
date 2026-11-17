@@ -5,9 +5,8 @@
 # sees a version whose files aren't there yet.
 #
 # Caches: a tag's own cache is visible only to that tag, so tags restore
-# master's. Master keeps them warm by building (without publishing) when
-# what the build depends on changes: Cargo.lock, the vendored crates, the
-# toolchain, this workflow. Let that run finish before tagging.
+# master's. This fork warms caches only on explicit manual builds, not
+# normal pushes.
 #
 # The cache is the whole target/, with scripts/ci-sources keeping unchanged
 # files fresh to Cargo: the vendored crates (gpui-kit, taffy, ghostty) are
@@ -16,38 +15,19 @@
 # Tests (the native screenshot test too) run only in ci.yml: a tag publishes
 # once ci.yml has passed for its commit.
 name: build and release
-# Master pushes only build (to keep the cache warm); tags publish.
+# Manual runs build only; explicit version tags publish.
 run-name: ${{ github.ref_type == 'tag' && format('release {0}', github.ref_name) || format('build {0}', github.ref_name) }}
 
 on:
   push:
     tags: ["v*"]
-    branches: [master]
-    paths:
-      - Cargo.lock
-      - Cargo.toml
-      - vendor/**
-      - crates/**
-      - scripts/package
-      - scripts/notices.*
-      - tests/notices.rs
-      - about.toml
-      - licenses/**
-      - LICENSE
-      - THIRD-PARTY-NOTICES
-      - scripts/mac-sign
-      - scripts/macos-entitlements.plist
-      - scripts/mac-dmg
-      - distribution/macos/dmg/**
-      - scripts/ci-sources
-      - .github/workflows/release.yml
   # Builds only; publishing needs a tag.
   workflow_dispatch:
 
 permissions:
   contents: read
 
-# Never cancel: a cancelled master build saves no cache, a cancelled tag no release.
+# Never cancel: a cancelled manual build saves no cache, a cancelled tag no release.
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false

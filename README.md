@@ -162,6 +162,10 @@ See the [command reference](docs/commands.md) for arguments.
 For bugs, mod API requests and code contributions, see [Contributing](CONTRIBUTING.md).
 
 Clone this repo with its submodules. Use Rust 1.95.0 and Zig 0.16.0, the versions used in [CI](.github/workflows/ci.yml).
+
+This fork runs checks locally for normal development. Cross-platform GitHub CI is
+optional and starts only through **Actions → ci → Run workflow**; PRs and pushes
+do not start it automatically.
 Linux needs the development packages listed in that workflow.
 
 ```sh

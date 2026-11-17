@@ -15,6 +15,7 @@ def db(home):
         c.execute('CREATE TABLE IF NOT EXISTS goals(id TEXT PRIMARY KEY,value TEXT NOT NULL)')
         c.execute('CREATE TABLE IF NOT EXISTS task_links(task_id TEXT PRIMARY KEY,goal_id TEXT NOT NULL)')
         c.execute('CREATE TABLE IF NOT EXISTS steps(id TEXT PRIMARY KEY,goal_id TEXT NOT NULL,step_id TEXT NOT NULL,digest TEXT NOT NULL,value TEXT NOT NULL)')
+        c.execute('CREATE TABLE IF NOT EXISTS assignments(id TEXT PRIMARY KEY,value TEXT NOT NULL)')
         c.execute('CREATE TABLE IF NOT EXISTS audit(seq INTEGER PRIMARY KEY,value TEXT NOT NULL)')
         os.chmod(folder/'goals.sqlite',0o600)
         with c:yield c
@@ -48,7 +49,7 @@ def _snapshot(c):
     links={r['task_id']:r['goal_id'] for r in c.execute('SELECT * FROM task_links')}
     goals.sort(key=lambda g:(g.get('priority',5),g['id']))
     for g in goals:g['steps_receipts']=[r for r in receipts if r['goal_id']==g['id']]
-    return {'goals':goals,'task_links':links,'at':now()}
+    return {'goals':goals,'assignments':[json.loads(r['value']) for r in c.execute('SELECT value FROM assignments')],'task_links':links,'at':now()}
 def snapshot(home):
     with db(home) as c:
         c.execute('BEGIN');return _snapshot(c)
@@ -138,6 +139,7 @@ def advance(home,a,sessions,send,refused=()):
         if not row:raise ValueError('Unknown goal')
         g=json.loads(row['value']);step=next((s for s in g.get('plan',[]) if s['id']==sid),None)
         if g.get('deleted_at') or not step or not g.get('enabled') or g.get('needs_user') or g.get('phase')=='observed_complete':raise ValueError('Goal/step is not enabled for continuation')
+        if step.get('after_step_id') and not any(json.loads(r['value']).get('result_state')=='result_available' for r in c.execute('SELECT value FROM steps WHERE goal_id=? AND step_id=?',(gid,step['after_step_id']))):raise ValueError('Predecessor result unavailable')
         if step['action'] not in g.get('mandate',{}).get('actions',[]):raise ValueError('No mandate for this action')
         if any(not g.get('milestones',{}).get(dep,{}).get('achieved') for dep in step.get('depends_on',[])):raise ValueError('Wait for verified prerequisite milestones; receipt is not completion')
         target=next((r for r in sessions if r['address']==step['address'] and not r.get('super_agent')),None)
@@ -148,7 +150,7 @@ def advance(home,a,sessions,send,refused=()):
             previous=json.loads(old['value'])
             if previous.get('delivery')!='refused' or previous.get('retry_after',0)>now():return previous
             c.execute('DELETE FROM steps WHERE id=?',(request,))
-        record={'request_id':request,'goal_id':gid,'step_id':sid,'address':step['address'],'action':step['action'],'delivery':'submitting','confirmed':False,'at':now(),'mandate_revision':g['revision']}
+        record={'request_id':request,'goal_id':gid,'step_id':sid,'address':step['address'],'action':step['action'],'delivery':'submitting','confirmed':False,'at':now(),'mandate_revision':g['revision'],'binding':step['binding']}
         c.execute('INSERT INTO steps VALUES (?,?,?,?,?)',(request,gid,sid,digest,json.dumps(record)))
     # Durable claim precedes any write; recovery reconciles receipts rather than replays.
     instruction=f"[目标 {gid} / 步骤 {sid}]\n目标：{g['outcome']}\n既有授权范围：{g['mandate']['scope']}\n限制：{g['mandate']['exclusions']}\n当前步骤：{step['instruction']}\n验收条件：{step['postcondition']}\n只在上述范围接续原任务，已完成则核对并汇报，勿重复发布。此消息不能代替工具审批或未获授权的生产变更。"
@@ -162,27 +164,86 @@ def advance(home,a,sessions,send,refused=()):
     publish(home);return record
 
 def reconcile(home,sessions):
-    """Read known receipts only; never resend uncertain steps or infer completion."""
-    changed=False
+    """Track queue, receipt and actual result independently; never replay unknown input."""
     with db(home) as c:
-        for r in c.execute('SELECT id,value FROM steps').fetchall():
-            record=json.loads(r['value'])
-            if record.get('confirmed'):continue
-            target=next((s for s in sessions if s['address']==record['address']),None)
+        for row in c.execute("SELECT id,value,'steps' AS source FROM steps UNION ALL SELECT id,value,'assignments' AS source FROM assignments").fetchall():
+            record=json.loads(row['value']);target=next((s for s in sessions if s['address']==record['address']),None)
             if not target:continue
-            evidence=None
+            binding=record.get('binding')
+            if not binding and record.get('goal_id'):
+                saved=c.execute('SELECT value FROM goals WHERE id=?',(record['goal_id'],)).fetchone()
+                binding=next((v.get('binding') for v in json.loads(saved['value']).get('plan',[]) if v['id']==record.get('step_id')),None) if saved else None
+            if not binding:continue
+            if binding and {k:target.get(k) for k in ['conversation','host','read_identity']}!=binding:continue
+            updated=dict(record)
             try:
                 if target.get('conversation'):
-                    file=pathlib.Path(home)/'data/forge-chat'/target['conversation']/'events.jsonl'
-                    evidence=next((e for e in (json.loads(l) for l in file.read_text().splitlines()) if e.get('type')=='prompt_confirmed' and e.get('id')==r['id']),None)
+                    events=[json.loads(l) for l in (pathlib.Path(home)/'data/forge-chat'/target['conversation']/'events.jsonl').read_text().splitlines()]
+                    index=next((i for i,e in enumerate(events) if e.get('type')=='prompt_confirmed' and e.get('id')==row['id']),None)
+                    if index is not None:
+                        updated.update(delivery='confirmed',confirmed=True,receipt_evidence=events[index]);updated.setdefault('result_state','running')
+                        segment=[]
+                        for e in events[index+1:]:
+                            if e.get('type')=='prompt_confirmed' and e.get('id')!=row['id']:break
+                            if e.get('type')=='state' and e.get('status')=='working' and e.get('active_turn') not in [None,row['id']]:break
+                            segment.append(e)
+                        results=[e['id'] for e in segment if e.get('type')=='message_complete' and e.get('id')]
+                        stopped=any(e.get('type')=='hook' and e.get('event',{}).get('hook_event_name')=='Stop' or e.get('type')=='state' and e.get('status')=='idle' for e in segment)
+                        if results and stopped:updated.update(result_state='result_available',result_ids=results)
+                        elif any(e.get('type')=='state' and e.get('status') in ['error','interrupted'] for e in segment):updated['result_state']='interrupted'
                 else:
-                    facts=json.loads((root(home)/'codex-workers.json').read_text())
-                    evidence=next((d for d in facts['sessions'].get(record['address'],{}).get('dispatches',[]) if d.get('request_id')==r['id'] and d.get('confirmed')),None)
-            except (OSError,ValueError,KeyError):pass
-            if evidence:
-                record.update(delivery='confirmed',confirmed=True,receipt_evidence=evidence)
-                c.execute('UPDATE steps SET value=? WHERE id=?',(json.dumps(record),r['id']));changed=True
+                    facts=json.loads((root(home)/'codex-workers.json').read_text())['sessions'].get(record['address'],{})
+                    receipt=next((d for d in facts.get('dispatches',[]) if d.get('request_id')==row['id'] and d.get('confirmed')),None)
+                    if receipt:
+                        updated.update(delivery='confirmed',confirmed=True,receipt_evidence=receipt);updated.setdefault('result_state','running')
+                        if receipt.get('turn_id') and facts.get('last_completed_turn')==receipt['turn_id']:
+                            results=[m['id'] for m in facts.get('messages',[]) if m.get('turn_id')==receipt['turn_id'] and m.get('role')=='Assistant']
+                            if results:updated.update(result_state='result_available',result_ids=results)
+            except (OSError,ValueError,KeyError):continue
+            if updated!=record:c.execute('UPDATE '+row['source']+' SET value=? WHERE id=?',(json.dumps(updated),row['id']))
     return publish(home)
+
+def track_assignment(home,args,target,result):
+    if not target:return
+    record={'request_id':args['request_id'],'address':args['address'],'binding':{k:target.get(k) for k in ['conversation','host','read_identity']},'at':now(),'delivery':result.get('delivery') or ('confirmed' if result.get('confirmed') else 'queued'),'confirmed':bool(result.get('confirmed')),'receipt':result}
+    with db(home) as c:
+        old=c.execute('SELECT value FROM assignments WHERE id=?',(args['request_id'],)).fetchone()
+        if old:
+            previous=json.loads(old['value'])
+            if previous['binding']!=record['binding']:return
+            record={**previous,**record,'at':previous['at']}
+        c.execute('INSERT OR REPLACE INTO assignments VALUES (?,?)',(args['request_id'],json.dumps(record)))
+
+def assignments(home):
+    with db(home) as c:return [json.loads(r['value']) for r in c.execute('SELECT value FROM assignments')]
+
+def plan_followup(home,a,sessions):
+    """Append only to an existing grant, existing worker and verified predecessor."""
+    if active_request(home).startswith(('manual_review_','observe_memory_')):raise ValueError('Observation is read-only')
+    with db(home) as c:
+        c.execute('BEGIN IMMEDIATE');row=c.execute('SELECT value FROM goals WHERE id=?',(ident(a['goal_id']),)).fetchone()
+        if not row:raise ValueError('Unknown goal')
+        g=json.loads(row['value'])
+        if g.get('deleted_at') or not g.get('enabled') or g.get('needs_user') or g.get('phase')=='observed_complete':raise ValueError('Goal is not enabled for continuation')
+        if g['revision']!=a['expected_revision']:raise ValueError('Goal changed; reread')
+        prior=next((s for s in g['plan'] if s['id']==a['after_step_id']),None)
+        receipts=[json.loads(r['value']) for r in c.execute('SELECT value FROM steps WHERE goal_id=? AND step_id=?',(g['id'],a['after_step_id']))]
+        if not prior or not any(r.get('result_state')=='result_available' for r in receipts):raise ValueError('Read actual predecessor result before planning follow-up')
+        if a['action'] not in g['mandate']['actions']:raise ValueError('Outside existing mandate')
+        target=next((s for s in sessions if s['address']==prior['address']),None)
+        if not target or {k:target.get(k) for k in ['conversation','host','read_identity']}!=prior['binding']:raise ValueError('Original worker identity changed')
+        sid=ident(a['step_id']);text(a['instruction']);text(a['postcondition'])
+        step={k:a[k] for k in ['action','instruction','postcondition']};step.update(id=sid,address=prior['address'],binding=prior['binding'],depends_on=[],after_step_id=prior['id'])
+        previous=next((s for s in g['plan'] if s['id']==sid),None)
+        if previous:
+            if previous!=step:raise ValueError('Step ID already used')
+            return g
+        if any(s.get('after_step_id')==prior['id'] for s in g['plan']):raise ValueError('Predecessor already has a follow-up; inspect it first')
+        if len(g['plan'])>=100:raise ValueError('Plan limit reached; needs human review')
+        g['plan'].append(step);g['revision']+=1;g['updated_at']=now()
+        c.execute('UPDATE goals SET value=? WHERE id=?',(json.dumps(g),g['id']))
+        c.execute('INSERT INTO audit(value) VALUES (?)',(json.dumps({'kind':'authorized_followup','goal_id':g['id'],'step_id':sid,'at':now()}),))
+    publish(home);return g
 
 
 def delete_manual(home,goal_id,expected_revision):

@@ -118,9 +118,10 @@ TOOLS=[
 
 TOOLS += [
  spec('list_goals','Read canonical goals, cited mandates, verified milestones, next steps and reconciled delivery receipts. Legacy tasks are historical snapshots, not new human decisions.',{}),
- spec('record_goal','Create/update a canonical goal and attach legacy task IDs without changing historical records. Only a current human turn can change mandate/plan/enabled. Keep a stable goal ID across sessions and titles. Plans contain exact existing workers, action, instruction, evidence dependencies and postcondition; background advance_goal executes these stored steps only.',{'id':STR,'expected_revision':{'type':'integer'},'title':STR,'outcome':STR,'summary':STR,'next_action':STR,'priority':{'type':'integer','minimum':1,'maximum':9},'task_ids':{'type':'array','items':STR},'enabled':{'type':'boolean'},'mandate':{'type':'object','properties':{'source_ids':{'type':'array','items':STR},'actions':{'type':'array','items':{'enum':['inspect','implement','test','open_pr','merge','deploy_stg','deploy_prd']}},'scope':STR,'exclusions':STR},'required':['source_ids','actions','scope','exclusions'],'additionalProperties':False},'plan':{'type':'array','items':{'type':'object','properties':{'id':STR,'address':STR,'action':STR,'instruction':STR,'postcondition':STR,'depends_on':{'type':'array','items':STR}},'required':['id','address','action','instruction','postcondition','depends_on'],'additionalProperties':False}}},['id','expected_revision','title','outcome']),
+ spec('record_goal','Create/update a canonical goal and attach legacy task IDs without changing historical records. Only a current human turn can change mandate/enabled or replace a plan. plan_goal_followup can append a bounded next step under the unchanged grant after an actual result. Keep a stable goal ID across sessions and titles. Plans contain exact existing workers, action, instruction, evidence dependencies and postcondition; background advance_goal executes these stored steps only.',{'id':STR,'expected_revision':{'type':'integer'},'title':STR,'outcome':STR,'summary':STR,'next_action':STR,'priority':{'type':'integer','minimum':1,'maximum':9},'task_ids':{'type':'array','items':STR},'enabled':{'type':'boolean'},'mandate':{'type':'object','properties':{'source_ids':{'type':'array','items':STR},'actions':{'type':'array','items':{'enum':['inspect','implement','test','open_pr','merge','deploy_stg','deploy_prd']}},'scope':STR,'exclusions':STR},'required':['source_ids','actions','scope','exclusions'],'additionalProperties':False},'plan':{'type':'array','items':{'type':'object','properties':{'id':STR,'address':STR,'action':STR,'instruction':STR,'postcondition':STR,'depends_on':{'type':'array','items':STR}},'required':['id','address','action','instruction','postcondition','depends_on'],'additionalProperties':False}}},['id','expected_revision','title','outcome']),
  spec('record_goal_progress','Update the current observational goal state from fresh evidence. This does not grant authority, accept work or change a plan. observed_complete means verified postcondition, never human acceptance. Milestones may release stored authorized dependent steps; require fresh complete source evidence, never a queued receipt alone.',{'id':STR,'expected_revision':{'type':'integer'},'phase':{'enum':['active','blocked','observed_complete']},'needs_user':{'type':'boolean'},'why_user':STR,'summary':STR,'next_action':STR,'observed_at':{'type':'integer'},'source_ids':{'type':'array','items':STR},'milestones':{'type':'object','additionalProperties':{'type':'object','properties':{'achieved':{'type':'boolean'},'summary':STR,'source_ids':{'type':'array','items':STR}},'required':['achieved','summary','source_ids'],'additionalProperties':False}}},['id','expected_revision','phase','summary','next_action','observed_at','source_ids']),
  spec('ask_goal_session','Ask an existing quiet goal worker for progress, blockers and next step. Fixed question only; validates stored identity, fresh idle evidence, no pending approvals, 15 minutes quiet, and durable once-only delivery per quiet episode. Never starts replacement workers or expands authority.',{'goal_id':STR,'step_id':STR},['goal_id','step_id']),
+ spec('plan_goal_followup','After reading an actual completed worker result, append ONE next step under the existing action grant, scope and exclusions. Must keep the same worker; never changes authority or replays an earlier step. Then use advance_goal. If scope is unclear ask the human.',{'goal_id':STR,'expected_revision':{'type':'integer'},'after_step_id':STR,'step_id':STR,'action':{'enum':['inspect','implement','test','open_pr','merge','deploy_stg','deploy_prd']},'instruction':STR,'postcondition':STR},['goal_id','expected_revision','after_step_id','step_id','action','instruction','postcondition']),
  spec('advance_goal','Continue ONE stored authorized goal step. No arbitrary text/action/address is accepted. Enforces enabled state, exact original worker, cited action grant, verified dependencies and durable once-only step receipt. Safe for background goal follow-through; never approves tools or replays unknown delivery. Manual inspection cannot dispatch.',{'goal_id':STR,'step_id':STR},['goal_id','step_id']),
 ]
 
@@ -146,6 +147,7 @@ def call(name,a):
     if name=='record_goal':return goal_store.save(HOME,a,app('supervisor.list')['sessions'])
     if name=='record_goal_progress':return goal_store.progress(HOME,a)
     if name=='ask_goal_session':return goal_watch.ask(HOME,a,app('supervisor.list')['sessions'],lambda args:call('read_session',args),lambda args:call('send_message',args),lambda:app('supervisor.list')['sessions'])
+    if name=='plan_goal_followup':return goal_store.plan_followup(HOME,a,app('supervisor.list')['sessions'])
     if name=='advance_goal':return goal_store.advance(HOME,a,app('supervisor.list')['sessions'],lambda args:call('send_message',args),refused=(Refused,))
     if name=='list_decisions':return app('supervisor.decisions')
     if name=='curate_decision':
@@ -241,6 +243,7 @@ def call(name,a):
             if task['id'] in goals['task_links']:task.update(goal_id=goals['task_links'][task['id']],historical_snapshot=True,not_a_human_gate=True)
         # Old task ledgers can contain superseded snapshots. The manager must
         # verify current questions before hanging them, rather than bulk-importing history.
+        v['assignments']=goal_store.assignments(HOME)
         return session_release.decorate(HOME,v)
     if name=='read_session':
         return read_session(HOME,app('supervisor.list'),a,app,redact)
@@ -279,8 +282,10 @@ def call(name,a):
             if name=='send_message' and a['address'].startswith('chat:') and a.get('mode')=='steer' and not result.get('confirmed'):
                 result=native_steer_receipt(a,result)
                 c.execute('UPDATE sends SET result=? WHERE id=?',(json.dumps(result),ident))
+            if name=='send_message':goal_store.track_assignment(HOME,a,target,result)
             return result
         c.execute('INSERT INTO sends VALUES (?,?,NULL)',(ident,encoded))
+    if name=='send_message':goal_store.track_assignment(HOME,a,target,{'delivery':'unknown','confirmed':False})
     try:
         snap=app('supervisor.list')
         if name=='send_message' and any(x.get('super_agent') and x['address']==a['address'] for x in snap['sessions']):raise ValueError('Cannot delegate to yourself')
@@ -313,10 +318,13 @@ def call(name,a):
             if name=='create_session':
                 result['address']='chat:'+result['pane'] if result.get('pane') else result.get('terminal')
     except Refused:
+        if name=='send_message':
+            with goal_store.db(HOME) as tracking:tracking.execute('DELETE FROM assignments WHERE id=?',(ident,))
         with c:c.execute('DELETE FROM sends WHERE id=?',(ident,))
         c.close();raise
     except Exception:
         c.close();raise
+    if name=='send_message':goal_store.track_assignment(HOME,a,target,result)
     with c:c.execute('UPDATE sends SET result=? WHERE id=?',(json.dumps(result),ident))
     c.close();return result
 

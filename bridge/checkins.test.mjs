@@ -77,11 +77,32 @@ test('unfinished goals have a periodic review even after adaptive wait and uncha
  const {planCheckin,followupPlan}=await import('./checkins.mjs');const now=Date.now();
  const snapshot={at:now,sessions:[],goals:[{id:'goal',phase:'active',enabled:true}]};
  const events=[{type:'user',id:'human',time:now-7200000},{type:'followup_plan',observation_id:'old',mode:'wait',basis_human_id:'human',time:now-7100000}];
- const plan=planCheckin({snapshot,events,state:{started_at:now-7200000},now});assert.equal(plan.event.kind,'goal_review');assert.equal(plan.event.mandatory_report,true);assert.deepEqual(plan.event.goal_ids,['goal']);
+ const plan=planCheckin({snapshot,events,state:{started_at:now-7200000},now});assert.equal(plan.event.kind,'goal_review');assert.equal(plan.event.mandatory_report,false);assert.deepEqual(plan.event.goal_ids,['goal']);
  const observed=[...events,{type:'observation',id:plan.id,time:now,events:[plan.event]}];
- assert.throws(()=>followupPlan(snapshot,observed,plan.id,{after_minutes:null,publish:false,reason:'nothing changed'},now),/must publish/);
+ assert.equal(followupPlan(snapshot,observed,plan.id,{after_minutes:null,publish:false,reason:'nothing changed'},now).publish,false);
  assert.equal(followupPlan(snapshot,observed,plan.id,{after_minutes:null,publish:true,reason:'verified goal blockers'},now).mode,'wait');
  assert.equal(planCheckin({snapshot,events:[...observed,{type:'goal_review_complete',id:plan.id,time:now}],state:plan.next,now}),null);
  assert.equal(planCheckin({snapshot:{...snapshot,at:now+3600001},events:[...observed,{type:'goal_review_complete',id:plan.id,time:now}],state:plan.next,now:now+3600001}).event.kind,'goal_review');
  assert.equal(planCheckin({snapshot,events,state:{started_at:now-7200000},config:{enabled:false},now}),null);
+});
+
+test('twenty hourly internal reviews, age/revision changes and restart never repeat the same report',()=>{
+ let history=[...events],state={started_at:now-7200000};let published=0;
+ for(let hour=0;hour<21;hour++){
+  const time=now+hour*3600001,snap={...snapshot,at:time,goals:[{id:'g',phase:'blocked',enabled:true,needs_user:true,source_ids:['same-source'],revision:hour,updated_at:time,summary:`Evidence ${92+hour} hours old`}]};
+  const review=planCheckin({snapshot:snap,events:history,state,now:time});assert(review);history.push({type:'observation',id:review.id,time,events:[review.event]});
+  const decision=followupPlan(snap,history,review.id,{after_minutes:null,publish:true,reason:'checked'},time);published+=Number(decision.publish);history.push({type:'followup_plan',...decision,time},{type:'goal_review_complete',time});state=JSON.parse(JSON.stringify(review.next));
+ }
+ assert.equal(published,1);
+ const changed={...snapshot,goals:[{id:'g',phase:'observed_complete',enabled:true,source_ids:['new-result']}]};
+ history.push({type:'observation',id:'observe_checkin_new',time:now+90000000});assert.equal(followupPlan(changed,history,'observe_checkin_new',{after_minutes:null,publish:true,reason:'actual result'},now+90000000).publish,true);
+});
+
+test('upgrade of real legacy report evidence is silent without hiding a changed goal',()=>{
+ const snap={...snapshot,goals:[{id:'g',phase:'blocked',enabled:true,source_ids:['proof']}]};
+ const old={type:'followup_plan',publish:true,basis_digest:fingerprint(snap)};
+ const history=[{type:'tool_result',content:{goals:snap.goals}},old,{type:'observation',id:'observe_checkin_upgrade',time:now}];
+ const args={after_minutes:null,publish:true,reason:'checked'};
+ assert.equal(followupPlan(snap,history,'observe_checkin_upgrade',args,now).publish,false);
+ assert.equal(followupPlan({...snap,goals:[{...snap.goals[0],phase:'observed_complete',source_ids:['new']}]},history,'observe_checkin_upgrade',args,now).publish,true);
 });
