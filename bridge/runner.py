@@ -147,7 +147,21 @@ try:
                             os.read(fd, 65536)
                         if writable:
                             raw = raw[os.write(fd, raw):]
-                    time.sleep(.1)
+                    # Let Claude consume and render the entire bracketed paste before
+                    # Enter. A fixed 100ms races multiline/image prompts on busy VMs.
+                    pasted = time.monotonic()
+                    last_output = pasted
+                    while time.monotonic() - pasted < 5:
+                        readable, _, _ = select.select([fd], [], [], .05)
+                        if readable:
+                            try:
+                                if not os.read(fd, 65536):
+                                    raise SystemExit(1)
+                            except BlockingIOError:
+                                pass
+                            last_output = time.monotonic()
+                        if time.monotonic() - pasted >= .5 and time.monotonic() - last_output >= .2:
+                            break
                     os.write(fd, b'\x18\x13' if c.get('mode') == 'steer' else b'\r')
                     report('submitted', request_id=c['request_id'])
 finally:

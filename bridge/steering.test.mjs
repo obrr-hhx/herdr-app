@@ -1,4 +1,4 @@
-import test from 'node:test';import assert from 'node:assert/strict';import fs from 'node:fs';import os from 'node:os';import path from 'node:path';import net from 'node:net';import {spawn}from'node:child_process';import {fileURLToPath}from'node:url';import {setTimeout as delay}from'node:timers/promises';import {Steering,unconfirmedSteering}from'./steering.mjs';
+import test from 'node:test';import assert from 'node:assert/strict';import fs from 'node:fs';import os from 'node:os';import path from 'node:path';import net from 'node:net';import {spawn}from'node:child_process';import {fileURLToPath}from'node:url';import {setTimeout as delay}from'node:timers/promises';import crypto from 'node:crypto';import {Steering,unconfirmedSteering}from'./steering.mjs';
 test('steering binds an exact active turn and exact prompt without resolving approvals',()=>{
  const s=new Steering(),c={request_id:'steer-test',expected_turn:'turn-a',text:'new direction'},ctx={manager:false,supported:true,busy:true,ready:true,approval:false,turn:'turn-a'};
  assert.equal(s.refusal(c,ctx),null);for(const patch of [{manager:true},{supported:false},{approval:true},{turn:'new-turn'},{busy:false}])assert(s.refusal(c,{...ctx,...patch}));
@@ -8,7 +8,7 @@ test('steering binds an exact active turn and exact prompt without resolving app
 });
 test('ordinary interactive PTY steers before Stop, queue stays FIFO, replay and approvals are safe',{skip:process.platform==='win32',timeout:20000},async()=>{
  const root=fs.realpathSync(fs.mkdtempSync('/tmp/hst-'));const mock=root+'/claude';fs.writeFileSync(mock,`#!/usr/bin/env python3
-import sys,json,os,socket,tty
+import sys,json,os,socket,tty,select
 if '--version' in sys.argv:print('2.1.319');sys.exit(0)
 folder=os.environ['HERDR_STEER_FIXTURE'];session=sys.argv[sys.argv.index('--session-id')+1]
 def hook(name,**fields):
@@ -16,6 +16,10 @@ def hook(name,**fields):
 tty.setraw(0);hook('SessionStart');data=b''
 while True:
  data+=os.read(0,65536)
+ if data.endswith(b'\\x1b[201~'):
+  readable,_,_=select.select([0],[],[],.3)
+  if readable:os.read(0,65536) # Ignore Enter while the pasted input is still being rendered.
+  os.write(1,b'paste ready')
  for suffix,mode in [(b'\\x18\\x13','steer'),(b'\\r','queue')]:
   if data.endswith(suffix) and b'\\x1b[201~' in data:
    text=data.split(b'\\x1b[200~',1)[1].split(b'\\x1b[201~',1)[0].decode();data=b''
@@ -29,13 +33,15 @@ while True:
   for(let i=0;i<100&&!fs.existsSync(root+'/run.sock');i++)await delay(20);
   socket=net.createConnection(root+'/run.sock');socket.setEncoding('utf8');let buffer='';socket.on('data',chunk=>{buffer+=chunk;let n;while((n=buffer.indexOf('\n'))>=0){seen.push(JSON.parse(buffer.slice(0,n)));buffer=buffer.slice(n+1);}});socket.on('error',()=>{});const send=c=>socket.write(JSON.stringify(c)+'\n');
   send({action:'subscribe',after:0});await wait(e=>e.type==='connected');const sid=seen.find(e=>e.type==='session').session_id;
-  send({action:'send',request_id:'original-turn-id',text:'original',images:[]});await wait(e=>e.type==='prompt_confirmed'&&e.id==='original-turn-id');await wait(e=>e.type==='capabilities'&&e.capabilities.includes('steer'));
+  const png=Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+j4l8AAAAASUVORK5CYII=','base64'),image=crypto.createHash('sha256').update(png).digest('hex');fs.mkdirSync(root+'/images');fs.writeFileSync(root+'/images/'+image+'.png',png);
+  const original='original\n看看截图';
+  send({action:'send',request_id:'original-turn-id',text:original,images:[image]});await wait(e=>e.type==='prompt_confirmed'&&e.id==='original-turn-id');await wait(e=>e.type==='capabilities'&&e.capabilities.includes('steer'));
   send({action:'send',request_id:'queued-after-turn',text:'later',images:[],mode:'queue'});await wait(e=>e.type==='ack'&&e.request_id==='queued-after-turn');
   const steer={action:'send',request_id:'steer-without-stop',text:'change direction',images:[],mode:'steer',expected_turn:'original-turn-id'};send(steer);await wait(e=>e.type==='prompt_confirmed'&&e.id===steer.request_id);
   send(steer);send({...steer,request_id:'stale-turn-message',expected_turn:'different-turn'});await wait(e=>e.type==='dispatch_receipt'&&e.id==='stale-turn-message'&&e.stage==='refused');
   let questionResolved=false;const question=hook({hook_event_name:'PreToolUse',session_id:sid,cwd:root,tool_name:'AskUserQuestion',tool_use_id:'fixture-question',tool_input:{questions:[]}}).then(()=>questionResolved=true);const permission=await wait(e=>e.type==='permission');
   send({...steer,request_id:'approval-blocked-message'});await wait(e=>e.type==='dispatch_receipt'&&e.id==='approval-blocked-message'&&e.stage==='refused');assert(!questionResolved);
-  const prompts=fs.readFileSync(root+'/prompts.jsonl','utf8').trim().split('\n').map(JSON.parse);assert.deepEqual(prompts,[{mode:'queue',text:'original'},{mode:'steer',text:'change direction'}]);assert(!seen.some(e=>e.type==='prompt_confirmed'&&e.id==='queued-after-turn'));
+  const prompts=fs.readFileSync(root+'/prompts.jsonl','utf8').trim().split('\n').map(JSON.parse);assert.deepEqual(prompts,[{mode:'queue',text:original+'\n\nAttached images (use Read to view these image files):\n'+root+'/images/'+image+'.png'},{mode:'steer',text:'change direction'}]);assert(!seen.some(e=>e.type==='prompt_confirmed'&&e.id==='queued-after-turn'));
   send({action:'permission',request_id:'decline-fixture-question',id:permission.id,decision:'deny'});await question;
   await hook({hook_event_name:'Stop',session_id:sid,cwd:root});await wait(e=>e.type==='prompt_confirmed'&&e.id==='queued-after-turn');
  }finally{socket?.destroy();child.kill('SIGTERM');await new Promise(r=>child.once('exit',r));fs.rmSync(root,{recursive:true,force:true});}
