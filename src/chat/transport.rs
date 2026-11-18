@@ -65,6 +65,12 @@ pub struct Connection {
     outbox: PathBuf,
 }
 impl Connection {
+    pub fn queued_sends(&self) -> usize {
+        self.pending
+            .lock()
+            .map(|rows| rows.values().filter(|v| v["action"] == "send").count())
+            .unwrap_or(0)
+    }
     #[cfg(test)]
     pub fn test_channel(outbox: PathBuf) -> (Self, mpsc::Receiver<Value>) {
         let (tx, rx) = mpsc::channel();
@@ -404,18 +410,28 @@ fn upload_images(config: &ChatConfig, command: &Value) -> Result<(), String> {
             &remote,
         ]);
     }
-    let mut child = command
+    let child = command
         .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
+        .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .map_err(|_| "Could not start image upload")?;
+    let payload =
+        serde_json::to_vec(&json!({"images":entries})).map_err(|_| "Image upload failed")?;
+    finish_image_upload(child, payload, Duration::from_secs(60))
+}
+
+fn finish_image_upload(
+    mut child: std::process::Child,
+    payload: Vec<u8>,
+    timeout: Duration,
+) -> Result<(), String> {
+    let mut input = child.stdin.take().ok_or("Image upload unavailable")?;
+    // A blocked SSH stdin write must be covered by the deadline too.
+    let writer = std::thread::spawn(move || input.write_all(&payload));
+    let started = std::time::Instant::now();
     let result = (|| -> Result<(), String> {
-        let mut input = child.stdin.take().ok_or("Image upload unavailable")?;
-        serde_json::to_writer(&mut input, &json!({"images":entries}))
-            .map_err(|_| "Image upload failed")?;
-        drop(input);
-        for _ in 0..600 {
+        while started.elapsed() < timeout {
             if let Some(status) = child.try_wait().map_err(|_| "Image upload failed")? {
                 return if status.success() {
                     Ok(())
@@ -423,7 +439,7 @@ fn upload_images(config: &ChatConfig, command: &Value) -> Result<(), String> {
                     Err("Image upload failed; message is kept for retry".into())
                 };
             }
-            std::thread::sleep(Duration::from_millis(100));
+            std::thread::sleep(Duration::from_millis(20));
         }
         Err("Image upload timed out; message is kept for retry".into())
     })();
@@ -431,7 +447,47 @@ fn upload_images(config: &ChatConfig, command: &Value) -> Result<(), String> {
         let _ = child.kill();
         let _ = child.wait();
     }
-    result
+    let written = writer.join().map_err(|_| "Image upload failed")?;
+    result?;
+    written.map_err(|_| "Image upload failed; message is kept for retry".into())
+}
+
+#[cfg(test)]
+mod image_upload_tests {
+    use super::*;
+
+    #[test]
+    fn upload_deadline_includes_a_full_stdin_pipe() {
+        let child = std::process::Command::new("python3")
+            .args(["-c", "import time; time.sleep(30)"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        let start = std::time::Instant::now();
+        let error = finish_image_upload(
+            child,
+            vec![b'x'; 2 * 1024 * 1024],
+            Duration::from_millis(100),
+        )
+        .unwrap_err();
+        assert!(error.contains("timed out"));
+        assert!(start.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn full_payload_is_written_before_upload_success() {
+        let child = std::process::Command::new("python3")
+            .args([
+                "-c",
+                "import sys; assert len(sys.stdin.buffer.read()) == 2097152",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        finish_image_upload(child, vec![b'x'; 2 * 1024 * 1024], Duration::from_secs(5)).unwrap();
+    }
 }
 
 pub fn install(host: &str) -> Result<(), String> {

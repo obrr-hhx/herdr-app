@@ -568,6 +568,14 @@ impl ChatView {
                             if e["type"] == "upload" {
                                 this.notice = e["message"].as_str().unwrap_or_default().into();
                             }
+                            if e["type"] == "transport" {
+                                let queued = this.connection.as_ref().map_or(0, |c| c.queued_sends());
+                                if queued > 0 {
+                                    this.notice = format!(
+                                        "远程尚未连接，{queued} 条消息（含图片）保存在本地，尚未送达。恢复连接后继续发送。"
+                                    );
+                                }
+                            }
                             if e["type"] == "permission_resolved" {
                                 if let Some(id) = e["id"].as_str() {
                                     this.decisions_in_flight.remove(id);
@@ -1026,6 +1034,8 @@ impl ChatView {
     pub fn can_steer(&self) -> bool {
         self.config.id != super::SUPER_ID
             && self.conversation.capabilities.iter().any(|c| c == "steer")
+            && self.conversation.dispatches.get(&self.conversation.active_turn)
+                .is_some_and(|r| r["stage"] == "confirmed")
     }
     pub fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.editor.read(cx).value();
@@ -3402,6 +3412,13 @@ mod interaction_tests {
         let send = cx.debug_bounds("chat-send").unwrap();
         cx.simulate_click(send.center(), Modifiers::default());
         cx.run_until_parked();
+        let sent = receiver.try_recv().unwrap();
+        assert_eq!(sent["mode"], "queue", "unconfirmed input cannot be steered");
+        view.update_in(cx, |v, window, cx| {
+            v.conversation.apply(&json!({"type":"prompt_confirmed","id":"original-turn"}));
+            v.editor.update(cx, |s, cx| s.set_value("改为先检查根因", window, cx));
+            v.send(window, cx);
+        });
         let sent = receiver.try_recv().unwrap();
         assert_eq!(sent["mode"], "steer");
         assert_eq!(sent["expected_turn"], "original-turn");
