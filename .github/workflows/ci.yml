@@ -150,7 +150,8 @@ jobs:
           python-version: 3.14.7
       - name: Bridge protocol and management tests
         run: |
-          node --test bridge/*.test.mjs
+          # CLI/PTY fixtures have bounded subprocess deadlines; avoid file-level resource contention.
+          node --test --test-concurrency=1 bridge/*.test.mjs
           PYTHONPATH=bridge python3 -m unittest discover -s bridge -p '*_test.py'
       - name: Mod and documentation tests
         run: npm exec --yes --package=bun@1.4.4 -- bun test scripts/files.test.ts scripts/picker.test.ts scripts/agents.test.ts scripts/spaces.test.ts scripts/docs.test.ts

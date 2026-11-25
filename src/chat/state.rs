@@ -50,6 +50,12 @@ impl Conversation {
         if !self.reminders.is_empty() {
             return format!("{} 条提醒待确认", self.reminders.len());
         }
+        if self.phase == "saving" {
+            return "Saving message…".into();
+        }
+        if self.phase == "storage_error" {
+            return "Storage unavailable · message retained".into();
+        }
         if self.status == "working" && self.last_progress > 0 {
             let seconds = now.saturating_sub(self.last_progress) / 1000;
             if seconds >= 90 {
@@ -370,6 +376,18 @@ impl Conversation {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn storage_wait_is_distinct_from_model_stall_even_after_ninety_seconds() {
+        let mut c = Conversation::default();
+        c.apply(&json!({"type":"connected","status":"idle","last_progress":1000,"phase":"saving"}));
+        assert_eq!(c.activity_label(181000), "Saving message…");
+        c.apply(&json!({"type":"activity","last_progress":1000,"phase":"storage_error"}));
+        assert_eq!(
+            c.activity_label(181000),
+            "Storage unavailable · message retained"
+        );
+    }
+
     #[test]
     fn external_question_survives_reconnect_until_its_runtime_resolves_it() {
         let mut c = Conversation::default();

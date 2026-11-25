@@ -1,6 +1,7 @@
 import {imageCommand,legacyImageDisplay} from './image-client.mjs';
 import {ensureStatusLine,readStatusLine,installStatusDispatcher} from './statusline.mjs';
-import net from 'node:net';import fs from 'node:fs';import os from 'node:os';import path from 'node:path';import {spawn,execFileSync} from 'node:child_process';import {setTimeout as delay} from 'node:timers/promises';import {fileURLToPath} from 'node:url';import {assertInactive,transcriptPath} from './import.mjs';
+import crypto from 'node:crypto';import net from 'node:net';import fs from 'node:fs';import os from 'node:os';import path from 'node:path';import {spawn,execFileSync} from 'node:child_process';import {setTimeout as delay} from 'node:timers/promises';import {fileURLToPath} from 'node:url';import {assertInactive,transcriptPath} from './import.mjs';
+const revision=crypto.createHash('sha256').update(fs.readFileSync(new URL('./daemon.mjs',import.meta.url))).update(fs.readFileSync(new URL('./journal.mjs',import.meta.url))).digest('hex');
 const [id,cwd,model='opus',resume='']=process.argv.slice(2);if(!/^[a-f0-9]{16,64}$/.test(id??'')||!path.isAbsolute(cwd??''))process.exit(2);
 const folder=path.join(process.env.HERDR_CHAT_HOME??path.join(os.homedir(),'.local/share/herdr-chat'),'conversations',id);fs.mkdirSync(folder,{recursive:true,mode:0o700});const sock=folder+'/run.sock';
 if(fs.existsSync(folder+'/runtime-released.json')){process.stdout.write(JSON.stringify({type:'command_error',message:'This runtime was explicitly released. Its history is preserved; create a new chat to run again.'})+'\n');process.exit(0);}
@@ -22,7 +23,7 @@ let legacy=false,remoteStatus='',upgrading=false;
 const upgradeTimer=setInterval(tryUpgrade,5000);upgradeTimer.unref();
 function tryUpgrade(){
  if(!legacy||remoteStatus!=='idle'||upgrading||process.env.HERDR_SUPER_AGENT==='1')return;
- upgrading=true;const child=spawn('python3',[fileURLToPath(new URL('./upgrade_idle.py',import.meta.url)),folder],{stdio:['ignore','pipe','ignore']});let result='';child.stdout.on('data',b=>result+=b);child.on('error',finish);child.on('exit',finish);let done=false;
+ upgrading=true;const child=spawn('python3',[fileURLToPath(new URL('./upgrade_idle.py',import.meta.url)),folder,revision],{stdio:['ignore','pipe','ignore']});let result='';child.stdout.on('data',b=>result+=b);child.on('error',finish);child.on('exit',finish);let done=false;
  function finish(){if(done)return;done=true;let outcome;try{outcome=JSON.parse(result);}catch{}if(outcome?.upgraded){socket.destroy();process.exit(0);return;}upgrading=false;const held=queued;queued=[];for(const c of held)forward(c);}
 }
 
@@ -35,7 +36,7 @@ function forward(c){
 }
 let wire='';socket.setEncoding('utf8');socket.on('data',chunk=>{wire+=chunk;let n;while((n=wire.indexOf('\n'))>=0){
  const line=wire.slice(0,n);wire=wire.slice(n+1);let e;try{e=legacyImageDisplay(folder,JSON.parse(line));}catch{process.exit(1);}
- if(e.type==='connected'){legacy=e.bridge_protocol!==2;remoteStatus=e.status;tryUpgrade();nativeImages=(e.capabilities??[]).includes('images');e.capabilities=[...new Set([...(e.capabilities??[]),'images'])];}
+ if(e.type==='connected'){legacy=e.bridge_protocol!==2||e.bridge_revision!==revision;remoteStatus=e.status;tryUpgrade();nativeImages=(e.capabilities??[]).includes('images');e.capabilities=[...new Set([...(e.capabilities??[]),'images'])];}
  if(e.type==='state')remoteStatus=e.status;
  if(!process.stdout.write(JSON.stringify(e)+'\n'))socket.pause();
  if(nativeImages!==null&&!upgrading&&queued.length){const pending=queued;queued=[];for(const c of pending){try{forward(c);}catch{process.stdout.write(JSON.stringify({type:'notice',message:'Could not prepare images. The queued message is kept for retry.'})+'\n');}}}

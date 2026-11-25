@@ -7,7 +7,7 @@ test('runtime changes are refused during a turn and acknowledged after idle', {s
   socket=net.createConnection(root+'/run.sock');const seen=[];let buffer='';socket.setEncoding('utf8');socket.on('data',s=>{buffer+=s;let n;while((n=buffer.indexOf('\n'))>=0){seen.push(JSON.parse(buffer.slice(0,n)));buffer=buffer.slice(n+1);}});socket.on('error',()=>{});
   const send=c=>socket.write(JSON.stringify(c)+'\n');const wait=async f=>{for(let i=0;i<150;i++){const e=seen.find(f);if(e)return e;await delay(20);}throw Error('control test timeout');};
   const hook=event=>new Promise((resolve,reject)=>{const h=net.createConnection(root+'/run.sock');h.on('error',reject);h.on('connect',()=>h.write(JSON.stringify({action:'hook',event})+'\n'));h.on('data',()=>{h.end();resolve();});});
-  send({action:'subscribe',after:0});await wait(e=>e.type==='connected');const sid=seen.find(e=>e.type==='session').session_id;
+  send({action:'subscribe',after:0});await wait(e=>e.type==='connected');await wait(e=>e.type==='session');const sid=seen.find(e=>e.type==='session').session_id;
   send({action:'configure',request_id:'config-before-turn',model:'opus',effort:'low'});await wait(e=>e.type==='ack'&&e.request_id==='config-before-turn');
   send({action:'send',request_id:'mock-test-prompt',text:'fixture'});
   await hook({hook_event_name:'SessionStart',session_id:sid,cwd:root,source:'startup'});await wait(e=>e.type==='state'&&e.status==='working');
@@ -48,7 +48,7 @@ test('a queued message survives a slow idle CLI restart', {skip:process.platform
  try{
   for(let i=0;i<100&&!fs.existsSync(root+'/run.sock');i++)await delay(20);
   socket=net.createConnection(root+'/run.sock');let buffer='';socket.setEncoding('utf8');socket.on('data',chunk=>{buffer+=chunk;let n;while((n=buffer.indexOf('\n'))>=0){seen.push(JSON.parse(buffer.slice(0,n)));buffer=buffer.slice(n+1);}});socket.on('error',()=>{});
-  const send=c=>socket.write(JSON.stringify(c)+'\n');send({action:'subscribe',after:0});await wait(e=>e.type==='connected');const sid=seen.find(e=>e.type==='session').session_id;
+  const send=c=>socket.write(JSON.stringify(c)+'\n');send({action:'subscribe',after:0});await wait(e=>e.type==='connected');await wait(e=>e.type==='session');const sid=seen.find(e=>e.type==='session').session_id;
   send({action:'send',request_id:'before-restart',text:'first'});
   await hook({hook_event_name:'SessionStart',session_id:sid,cwd:root});await wait(e=>e.type==='state'&&e.status==='working');
   for(let i=0;i<250&&!fs.existsSync(root+'/pids');i++)await delay(20);

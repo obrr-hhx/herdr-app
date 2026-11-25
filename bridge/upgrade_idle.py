@@ -2,7 +2,7 @@
 import contextlib,fcntl,json,os,pathlib,signal,sys,time
 from runtime_release import processes,owned,alive
 
-def upgrade(folder):
+def upgrade(folder,revision=None):
  raw_folder=pathlib.Path(folder).absolute();root=raw_folder.parent.parent.resolve();folder=raw_folder.resolve()
  if folder.name=='73757065726167656e74000000000001':return {'upgraded':False,'reason':'manager'}
  with (folder/'upgrade.lock').open('a') as lock:
@@ -13,7 +13,7 @@ def upgrade(folder):
    pid,identity=next(iter(daemons.items()))
    try:
     marker=json.loads((folder/'bridge-protocol.json').read_text())
-    if marker.get('pid')==pid and marker.get('version',0)>=2:return None,'already_current'
+    if marker.get('pid')==pid and marker.get('version',0)>=2 and (revision is None or marker.get('revision')==revision):return None,'already_current'
    except (OSError,ValueError):pass
    # Every client for this exact conversation is counted; another app's client
    # makes upgrading unsafe because its incoming input cannot be held here.
@@ -30,7 +30,9 @@ def upgrade(folder):
     more={p:r for p,r in rows.items() if r['parent'] in tree and p not in tree and not r['state'].startswith('Z')}
     if not more:break
     tree.update(more)
-   if len(tree)>3:return None,'background_processes'
+   # The daemon's lock helper is infrastructure, not a background user tool.
+   lock_helpers={p for p,r in tree.items() if r['parent']==pid and ' -u -c import os,sys' in r['command'] and pathlib.Path(r['command'].rsplit(' ',1)[-1]).resolve()==folder/'daemon.lock'}
+   if len(tree)-len(lock_helpers)>3:return None,'background_processes'
    if len(tree)>1 and not any(owned(r,root/'runner.py',folder) for r in tree.values()):return None,'unknown_runtime'
    try:es=[json.loads(l) for l in (folder/'events.jsonl').read_text().splitlines()]
    except (OSError,ValueError):return None,'history'
@@ -59,5 +61,5 @@ def upgrade(folder):
    time.sleep(.1)
   return {'upgraded':False,'reason':'exit_unconfirmed'}
 if __name__=='__main__':
- try:print(json.dumps(upgrade(sys.argv[1])))
+ try:print(json.dumps(upgrade(sys.argv[1],sys.argv[2] if len(sys.argv)>2 else None)))
  except Exception:print(json.dumps({'upgraded':False,'reason':'guard_unavailable'}))

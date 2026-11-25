@@ -10,8 +10,9 @@ if(m.method==='initialize')reply({});if(m.method==='config/read')reply({config:{
 if(m.method==='turn/start'){stage=0;reply({turn:{id:'pipeline-turn'}});call('review_memories',{});}
 if(m.id>100&&m.result){let result={};try{result=JSON.parse(m.result.contentItems[0].text);}catch{}if(stage===0){stage=1;if(!result.memories.length)call('record_memory',{topic:'report.results',expected_revision:0,title:'先给结论与证据',content:'先给结论与证据，持续推进到有结果',kind:'workflow',confidence:'explicit',importance:5,sources:[{id:'human-memory-feedback',quote:'先给结论和证据，不要只报告中间状态'}]});else call('review_memories',{});}
 else if(stage===1){stage=2;call('review_memories',{});}
-else if(stage===2){stage=3;call('consolidate_memories',{expected_version:result.version,reviewed_source_ids:result.pending_human_feedback.map(r=>r.id),profile:[],preferences:result.memories.map(r=>({text:r.content,memory_ids:[r.id]})),topics:[]});}
-else if(stage===3){stage=4;call('send_message',{address:'t1',text:'MUST NOT SEND',request_id:'forbidden-memory-send'});}
+else if(stage===2){stage=3;globalThis.review=result;call('read_tool_result',{result_id:result.result_id,path:'/pending_human_feedback',limit:25});}
+else if(stage===3){stage=4;call('consolidate_memories',{expected_version:globalThis.review.version,reviewed_source_ids:result.items.map(r=>r.id),profile:[],preferences:globalThis.review.memories.map(r=>({text:r.content,memory_ids:[r.id]})),topics:[]});}
+else if(stage===4){stage=5;call('send_message',{address:'t1',text:'MUST NOT SEND',request_id:'forbidden-memory-send'});}
 else{fs.appendFileSync(process.env.QA_TRACE,JSON.stringify({forbidden_call_blocked:m.result.success===false})+'\\n');emit({method:'item/agentMessage/delta',params:{threadId:'pipeline',itemId:'maintenance-report',delta:'Routine memory work must stay hidden'}});emit({method:'turn/completed',params:{turn:{id:'pipeline-turn',status:'completed'}}});}}
 });`,{mode:0o700});
  let child;try{for(let run=0;run<2;run++){

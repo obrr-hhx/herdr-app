@@ -10,6 +10,27 @@ class Goals(unittest.TestCase):
   self.sessions=[{'address':'chat:p','conversation':'original','host':'qa'}]
   self.args={'id':'goal-qa','expected_revision':0,'title':'端到端目标','outcome':'完成STG验收','task_ids':['old-task'],'enabled':True,'mandate':{'source_ids':['human-grant'],'actions':['test'],'scope':'仅STG验证','exclusions':'不合并、不生产发布、不批准工具'},'plan':[{'id':'verify','address':'chat:p','action':'test','instruction':'接续原验证','postcondition':'返回验证证据','depends_on':['ready']}],'summary':'等待前置条件','next_action':'确认ready'}
   self.goal=g.save(self.home,self.args,self.sessions)
+ def test_assignment_keeps_original_request_and_correction_without_manager_prohibitions(self):
+  messages=[{'type':'user','id':'credit-request','text':'给 STG 测试账号 qa 增加 50000 积分。','time':101},{'type':'user','id':'credit-correction','text':'直接改 STG 数据库，补齐后核对入账。','time':102}]
+  with self.events.open('a') as f:
+   for event in messages:f.write(json.dumps(event)+'\n')
+  (g.root(self.home)/'active-observation.json').write_text(json.dumps({'id':'credit-correction'}))
+  a={'id':'credits','title':'补测试积分','outcome':'恢复回放','enabled':True,'mandate':{'source_ids':['credit-correction','credit-request'],'actions':['implement'],'scope':'管家概括的范围','exclusions':'不直接改账表，仅用管理员入口'},'plan':[{'id':'grant','address':'chat:p','action':'implement','instruction':'用于继续原来的回放测试。','postcondition':'核对余额和入账记录。','depends_on':[]}]}
+  g.save(self.home,a,self.sessions);sent=[]
+  g.advance(self.home,{'goal_id':'credits','step_id':'grant'},self.sessions,lambda a:sent.append(a) or {'queued':True})
+  body=sent[0]['text']
+  for event in messages:self.assertIn('> '+event['text'],body)
+  self.assertLess(body.index(messages[0]['text']),body.index(messages[1]['text']))
+  self.assertIn('用于继续原来的回放测试。',body);self.assertIn('核对余额和入账记录。',body)
+  for invented in ['不直接改账表','仅用管理员入口','管家概括的范围','既有授权范围','此消息不能代替']:self.assertNotIn(invented,body)
+  self.assertIn('不增加或缩减用户要求',body)
+  g.advance(self.home,{'goal_id':'credits','step_id':'grant'},self.sessions,lambda a:self.fail('wording change must not resend'))
+ def test_no_exclusion_needs_to_be_invented_to_save_a_goal(self):
+  a={**self.args,'expected_revision':self.goal['revision'],'mandate':{**self.args['mandate'],'exclusions':''}}
+  saved=g.save(self.home,a,self.sessions);self.assertEqual(saved['mandate']['exclusions'],'')
+ def test_legacy_assignment_recovers_verified_human_text(self):
+  goal=json.loads(json.dumps(self.goal));goal['mandate'].pop('human_sources')
+  self.assertIn('> 先做STG验证，再按结果接续原任务，不上生产。',g.assignment_text(self.home,goal,goal['plan'][0]))
  def test_delivery_result_and_bounded_followup_end_to_end(self):
   self.proof();sent=[];args={'goal_id':'goal-qa','step_id':'verify'}
   receipt=g.advance(self.home,args,self.sessions,lambda a:sent.append(a) or {'queued':True})
@@ -27,7 +48,7 @@ class Goals(unittest.TestCase):
   after=g.plan_followup(self.home,follow,self.sessions);self.assertEqual(after['mandate'],checked['mandate'])
   g.advance(self.home,{'goal_id':'goal-qa','step_id':'next'},self.sessions,lambda a:sent.append(a) or {'queued':True})
   g.advance(self.home,{'goal_id':'goal-qa','step_id':'next'},self.sessions,lambda a:self.fail('duplicate send'))
-  self.assertEqual(len(sent),2);self.assertIn('不合并、不生产发布、不批准工具',sent[-1]['text'])
+  self.assertEqual(len(sent),2);self.assertIn('先做STG验证，再按结果接续原任务，不上生产。',sent[-1]['text'])
  def test_unrelated_later_turn_never_satisfies_a_queued_assignment(self):
   target=self.sessions[0];a={'address':target['address'],'request_id':'direct-assignment'};g.track_assignment(self.home,a,target,{'queued':True})
   folder=self.home/'data/forge-chat/original';folder.mkdir();es=[{'type':'prompt_confirmed','id':'direct-assignment'},{'type':'prompt_confirmed','id':'another-turn'},{'type':'message_complete','id':'unrelated-result'},{'type':'state','status':'idle'}];(folder/'events.jsonl').write_text(''.join(json.dumps(e)+'\n' for e in es))
@@ -55,7 +76,7 @@ class Goals(unittest.TestCase):
   with self.assertRaisesRegex(ValueError,'prerequisite'):g.advance(self.home,{'goal_id':'goal-qa','step_id':'verify'},self.sessions,send)
   self.proof();a={'goal_id':'goal-qa','step_id':'verify'}
   result=g.advance(self.home,a,self.sessions,send);self.assertEqual(result['delivery'],'queued');self.assertEqual(g.advance(self.home,a,self.sessions,send),result);self.assertEqual(len(calls),1)
-  self.assertIn('不合并、不生产发布、不批准工具',calls[0]['text'])
+  self.assertIn('先做STG验证，再按结果接续原任务，不上生产。',calls[0]['text'])
   # Restart reads the same durable claim, never executes it a second time.
   self.assertEqual(g.snapshot(self.home)['goals'][0]['steps_receipts'][0]['request_id'],result['request_id'])
   g.advance(self.home,a,self.sessions,send);self.assertEqual(len(calls),1)
@@ -111,6 +132,19 @@ class Goals(unittest.TestCase):
   future=g.now()+61000
   with patch.object(g,'now',return_value=future):g.advance(self.home,a,self.sessions,send,refused=(Refused,))
   self.assertEqual(len(calls),2);self.assertEqual(calls[0],calls[1])
+ def test_reconcile_reads_one_consistent_history_per_worker_for_multiple_receipts(self):
+  from unittest.mock import patch
+  self.proof();receipt=g.advance(self.home,{'goal_id':'goal-qa','step_id':'verify'},self.sessions,lambda a:{'queued':True})
+  g.track_assignment(self.home,{'request_id':'other-request','address':'chat:p'},self.sessions[0],{'queued':True})
+  journal=self.home/'data/forge-chat/original/events.jsonl';journal.parent.mkdir()
+  records=[]
+  for ident in [receipt['request_id'],'other-request']:records += [{'type':'prompt_confirmed','id':ident},{'type':'message_complete','id':'result-'+ident},{'type':'state','status':'idle'}]
+  journal.write_text(''.join(json.dumps(r)+'\n' for r in records));original=pathlib.Path.read_text;reads=[]
+  def read(path,*args,**kwargs):
+   if path==journal:reads.append(path)
+   return original(path,*args,**kwargs)
+  with patch.object(pathlib.Path,'read_text',read):state=g.reconcile(self.home,self.sessions)
+  self.assertEqual(len(reads),1);self.assertTrue(state['goals'][0]['steps_receipts'][0]['confirmed']);self.assertTrue(state['assignments'][0]['confirmed']);self.assertEqual(state['assignments'][0]['result_state'],'result_available')
  def test_projection_can_be_recovered_from_durable_store(self):
   (g.root(self.home)/'goals.json').write_text('corrupt projection')
   result=g.reconcile(self.home,self.sessions)
