@@ -7,6 +7,7 @@ import goal_store
 import memory_store
 import schedule_store
 import checkins
+import tool_queries
 from codex_workers import control as codex_control, DispatchRefused
 HOME=pathlib.Path(os.environ['HERDR_APP_HOME'])
 BIN=os.environ['HERDR_APP_BIN']
@@ -98,8 +99,8 @@ TOOLS=[
  spec('plan_followup','During a background observation, decide your own NEXT check: after_minutes 1..10080, or null to wait for the human/new evidence. publish=false suppresses this periodic report and its banner. Call before final text. Explain urgency/backoff in reason. This changes only your own follow-up clock, never worker tasks or user preferences.',{'after_minutes':{'type':['integer','null'],'minimum':1,'maximum':10080},'publish':{'type':'boolean'},'reason':STR},['after_minutes','publish','reason']),
  spec('get_checkin_settings','Read proactive progress-report preferences and delivery limits.',{}),
  spec('configure_checkins','Change proactive reporting only at the HUMAN request. goal_review_minutes controls mandatory goal progress reviews (default 60), independent of adaptive wait. idle_minutes is the initial inactivity delay (1..1440). interval_minutes is accepted for compatibility but does not control adaptive follow-ups. This never dispatches worker tasks.',{'enabled':{'type':'boolean'},'idle_minutes':{'type':'integer','minimum':1,'maximum':1440},'interval_minutes':{'type':'integer','minimum':1,'maximum':1440},'goal_review_minutes':{'type':'integer','minimum':1,'maximum':1440},'desktop_notifications':{'type':'boolean'},'user_intent_id':STR},['user_intent_id']),
- spec('list_sessions','List all automatically tracked local/remote sessions, connectivity, original status, existing machines and task ledger.',{}),
- spec('inspect_sessions','Read all worker sessions concurrently for an overview, including local source terminals and offline native history. Return evidence, connectivity and freshness separately; one failure never blocks the others.',{'addresses':{'type':'array','items':STR,'maxItems':24}}),
+ spec('list_sessions','Read a compact session inventory. Select collection to inspect machines, tasks, goals, assignments or closed sessions separately.',{}),
+ spec('inspect_sessions','Inspect one bounded page of worker sessions concurrently for an overview, including local source terminals and offline native history. Return evidence, connectivity and freshness separately; one failure never blocks the others.',{'addresses':{'type':'array','items':STR,'maxItems':24}}),
  spec('read_session','Read bounded evidence without focusing, scrolling or marking Done seen. Returns provenance, freshness, partial-history limits and offline cached evidence.',{'address':STR,'offset':{'type':'integer','minimum':0},'limit':{'type':'integer','minimum':1,'maximum':40}},['address']),
  spec('send_message','Send an authorized follow-up without touching drafts. Default mode=queue waits for current work; local Codex and capable native Claude support mode=steer to adjust the verified active turn. Native Claude uses ordinary interactive sendNow, preserves approval gates and returns confirmed only after its prompt hook acknowledges the exact text. Native read_session exposes per-request dispatches; never call transport queuing completed steering. Unsupported/changed runtimes are refused, never silently downgraded. Use a unique request_id per assignment; reuse that ID on retry. Local Codex continues its exact existing runtime thread via turn/start, not terminal typing. A dispatch error is never permission to create a replacement worker. Never use this to answer an approval.',{'address':STR,'text':STR,'request_id':STR,'mode':{'enum':['queue','steer']}},['address','text','request_id']),
  spec('close_session','Archive exactly one explicitly user-authorized session from Herdr and its managed list; retain history/files and underlying runtime. Call directly, never delegate shell/terminal commands to a worker. Requires the latest user_intent_id and a stable request_id. Only report closed after verified=true; pending is not completion.',{'address':STR,'request_id':STR,'user_intent_id':STR},['address','request_id','user_intent_id']),
@@ -110,7 +111,7 @@ TOOLS=[
  spec('list_reminders','Get the current local date/time for relative phrases, plus persisted reminders, recurrence and unread deliveries.',{'timezone':STR}),
  spec('cancel_reminder','Cancel a reminder and dismiss its unread deliveries only when the human requests it.',{'id':STR,'user_intent_id':STR},['id','user_intent_id']),
  spec('acknowledge_reminder','Mark a delivered reminder read only after an explicit human response; reading it yourself is not acknowledgment.',{'delivery_id':STR,'user_intent_id':STR},['delivery_id','user_intent_id']),
- spec('list_decisions','Read persistent human decision cards. pending needs a human reply; answered is queued and still needs follow-through; resolved is human-marked complete.',{}),
+ spec('list_decisions','Read persistent human decision cards; default includes only pending and answered. pending needs a human reply; answered is queued and still needs follow-through; resolved is human-marked complete.',{}),
  spec('record_decision','Only after judging that current HUMAN input is necessary: read list_decisions and fresh source evidence, then update an existing card or explicitly create one. Explain why existing authority is insufficient in reason. decision_key identifies the same decision across titles/snapshots, never use timestamps/status as its identity. source_ids are exact message/question IDs. Shared-source collisions require updating/merging the existing card, or distinct_from plus a reason explaining truly separate questions. No worker writes, acceptance or approvals.',{'id':STR,'title':STR,'context':STR,'address':STR,'decision_key':STR,'reason':STR,'source_ids':{'type':'array','items':STR,'minItems':1,'maxItems':12},'distinct_from':{'type':'array','items':STR,'maxItems':12},'options':{'type':'array','items':STR,'maxItems':6},'evidence':STR},['id','title','context','address','decision_key','reason','source_ids']),
  spec('curate_decision','After inspecting the board/evidence, merge genuinely duplicate pending cards into keeper id, or withdraw a pending card that is obsolete/not a human decision. Requires an explanatory reason; retains original records as archived, never marks work accepted/completed, never changes worker tasks. Cannot modify answered/completed cards.',{'action':{'enum':['merge','withdraw']},'id':STR,'duplicate_ids':{'type':'array','items':STR,'maxItems':12},'reason':STR},['action','id','reason']),
  spec('record_task','Ledger only: persist task authority/evidence; NO stage automatically creates a decision card. Separately judge whether a concrete human decision is needed before using record_decision. awaiting_review survives idle/disconnect; accepted requires explicit user acceptance.',{'id':STR,'title':STR,'address':STR,'mandate':STR,'stage':{'enum':['working','waiting_user','awaiting_review','accepted','failed','paused']},'summary':STR,'evidence':STR,'next_action':STR,'user_intent_id':STR},['id','title','address','mandate','stage','summary']),
@@ -135,7 +136,46 @@ TOOLS += [
  spec('forget_memory','Delete a collaboration note after an explicit CURRENT human request naming its ID. Removes stored text and sources; original chat history remains. Older evidence cannot silently recreate the note.',{'id':STR,'expected_revision':{'type':'integer'},'user_intent_id':STR,'quote':STR},['id','expected_revision','user_intent_id','quote']),
 ]
 
+
+# Paging is a public-tool concern. Internal validation still reads canonical,
+# complete stores, never these abbreviated model-facing views.
+PAGE={'offset':{'type':'integer','minimum':0},'limit':{'type':'integer','minimum':1,'maximum':25},'query':{'type':'string','maxLength':300},'status':STR,'address':STR,'result_id':STR}
+for tool in TOOLS:
+ name=tool['name']
+ if name in tool_queries.LISTS:
+  tool['inputSchema']['properties'].update({k:v for k,v in PAGE.items() if name!='inspect_sessions' or k!='result_id'})
+  if name in tool_queries.COLLECTIONS:tool['inputSchema']['properties']['collection']={'enum':tool_queries.COLLECTIONS[name]}
+  tool['description']+=' Returns one summary page (default 8, max 25), total/next_offset/result_id. query searches full records; status=all includes history. Reuse result_id for stable paging. Read exact fields with read_tool_result; summaries are not complete source evidence.'
+ if name=='inspect_sessions':tool['description']=tool['description'].replace('Reuse result_id for stable paging.','Inventory pages are fresh; deduplicate addresses if inventory changes. Use result_id only for cached details.')
+ if name=='read_session':
+  tool['inputSchema']['properties'].update({k:v for k,v in PAGE.items() if k in ['offset','limit','query']})
+  tool['description']+=' query scans up to 120 source messages per call; continue next_offset until exhausted. Message text is an excerpt; result_id and detail_path retrieve exact text.'
+ if name=='read_memory':
+  tool['inputSchema']['properties'].update({'query':STR,'offset':{'type':'integer','minimum':0},'limit':{'type':'integer','minimum':1,'maximum':2000},'path':STR})
+  tool['description']+=' Returns a compact record; query/offset/limit can read its content, or use result_id with read_tool_result for exact fields/sources.'
+TOOLS.append(spec('read_tool_result','Read/search a private redacted result snapshot without re-running the original tool. path is a JSON pointer, e.g. /decisions/0/context. Objects and lists page up to 25 entries (default 8); plain text pages up to 2000 characters. With a text query, offset pages matching excerpts and match_offset locates full text. Results expire after 6 hours; refresh reads, NEVER repeat writes to recover a receipt. Cached evidence keeps its source times and is not a fresh execution check.',{'result_id':STR,'path':STR,'offset':{'type':'integer','minimum':0},'limit':{'type':'integer','minimum':1,'maximum':2000},'query':{'type':'string','maxLength':300}},['result_id']))
+
+def invoke(name,a):
+ if name not in {t['name'] for t in TOOLS}:raise ValueError('Unknown tool')
+ return tool_queries.invoke(HOME,name,a,call)
+
 def call(name,a):
+    if name=='_inventory':
+        value=app('supervisor.list');collection=a.get('collection','sessions')
+        if collection=='tasks':
+            c=db()
+            try:value['tasks']=[json.loads(r[0]) for r in c.execute('SELECT value FROM tasks')]
+            finally:c.close()
+            links=goal_store.snapshot(HOME)['task_links']
+            for task in value['tasks']:
+                task['session_closed']=not any(s['address']==task.get('address') for s in value['sessions']) and any(s['address']==task.get('address') for s in value.get('closed_sessions',[]))
+                if task['id'] in links:task.update(goal_id=links[task['id']],historical_snapshot=True,not_a_human_gate=True)
+        elif collection=='goals':value.update(goals=goal_store.snapshot(HOME)['goals'],receipt_reconciled=False)
+        elif collection=='assignments':value['assignments']=goal_store.assignments(HOME)
+        return session_release.decorate(HOME,value) if collection=='closed_sessions' else value
+    if name=='_memory_snapshot':
+        value=memory_store.snapshot(HOME)
+        return {k:value[k] for k in ['version','memories']}|{'scope':'collaboration_only','authority':False}
     if name=='list_memories':return memory_store.list_notes(HOME,a)
     if name=='read_memory':return memory_store.read_note(HOME,a)
     if name=='review_memories':return memory_store.review(HOME,a)
@@ -293,8 +333,9 @@ def call(name,a):
             host=a.get('host') or '@local'
             if host!='@local' and not any(x.get('host')==host for x in snap['sessions']) and not configured_ssh_host(host):raise Refused('Unknown SSH host; add an explicit Host alias to ~/.ssh/config first. No worker created.')
             # Only installs helper files; does not stop or restart user sessions.
-            r=subprocess.run([BIN,'chat-install',host],capture_output=True,text=True,timeout=30)
-            if r.returncode:raise ValueError('Could not install worker bridge')
+            try:r=subprocess.run([BIN,'chat-install',host],capture_output=True,text=True,timeout=30)
+            except subprocess.TimeoutExpired:raise Refused('Worker bridge installation timed out before session creation; no worker or assignment was created. An SSH alias does not prove this host is available. Inspect the original session and verify the target host before retrying this same request.')
+            if r.returncode:raise Refused('Worker bridge installation failed before session creation; no worker or assignment was created. An SSH alias does not prove this host is available. Inspect the original session and verify the target host before retrying this same request.')
         if name=='send_message' and not a['address'].startswith('chat:'):
             target=next((x for x in snap['sessions'] if x['address']==a['address']),None)
             if not target:raise Refused('Original session is unavailable; nothing sent')
@@ -334,7 +375,7 @@ def handle(r):
     if method=='ping':return {}
     if method=='tools/list':return {'tools':TOOLS}
     if method=='tools/call':
-        try:v=redact(call(r['params']['name'],r['params'].get('arguments',{})));return {'content':[{'type':'text','text':json.dumps(v,ensure_ascii=False)}]}
+        try:v=redact(invoke(r['params']['name'],r['params'].get('arguments',{})));return {'content':[{'type':'text','text':json.dumps(v,ensure_ascii=False,separators=(',',':'))}]}
         except Exception as e:return {'content':[{'type':'text','text':redact(str(e))[:500]}],'isError':True}
     raise ValueError('unknown method')
 
@@ -342,7 +383,7 @@ if __name__=='__main__':
     if sys.argv[1:]==['--tools']:
         print(json.dumps(TOOLS));raise SystemExit(0)
     if len(sys.argv)==4 and sys.argv[1]=='--call':
-        try:print(json.dumps(redact(call(sys.argv[2],json.loads(sys.argv[3]))),ensure_ascii=False))
+        try:print(json.dumps(redact(invoke(sys.argv[2],json.loads(sys.argv[3]))),ensure_ascii=False,separators=(',',':')))
         except Exception as e:print(json.dumps({'error':redact(str(e))[:500]}));raise SystemExit(1)
         raise SystemExit(0)
     for line in sys.stdin:

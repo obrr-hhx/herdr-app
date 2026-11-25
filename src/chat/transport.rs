@@ -25,6 +25,23 @@ pub fn quote(s: &str) -> String {
 pub fn local_dir(id: &str) -> PathBuf {
     crate::mods::app_dir().join("data/forge-chat").join(id)
 }
+fn local_proxy_bypass(existing: &str) -> String {
+    // Empty NO_PROXY entries are interpreted as a catch-all by some clients.
+    existing
+        .split(',')
+        .chain([
+            ".corp.alva.xyz",
+            ".corp.stg.alva.xyz",
+            "forge.corp.stg.alva.xyz",
+            "bytebase-et.corp.alva.xyz",
+            "localhost",
+            "127.0.0.1",
+        ])
+        .map(str::trim)
+        .filter(|rule| !rule.is_empty())
+        .collect::<Vec<_>>()
+        .join(",")
+}
 pub fn load_history(path: &Path) -> std::io::Result<Vec<Value>> {
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
@@ -176,9 +193,7 @@ impl Connection {
                         let existing = std::env::var("NO_PROXY")
                             .or_else(|_| std::env::var("no_proxy"))
                             .unwrap_or_default();
-                        let direct = format!(
-                            "{existing},.corp.alva.xyz,.corp.stg.alva.xyz,forge.corp.stg.alva.xyz,bytebase-et.corp.alva.xyz,localhost,127.0.0.1"
-                        );
+                        let direct = local_proxy_bypass(&existing);
                         command.env("NO_PROXY", &direct).env("no_proxy", &direct);
                         for key in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
                             command.env(key, &proxy);
@@ -457,6 +472,19 @@ mod image_upload_tests {
     use super::*;
 
     #[test]
+    fn local_proxy_bypass_has_no_empty_catch_all_and_keeps_direct_services() {
+        for existing in ["", ",", " , example.com, ,127.0.0.1,"] {
+            let rules = local_proxy_bypass(existing);
+            assert!(rules.split(',').all(|rule| !rule.is_empty()));
+            assert!(rules.split(',').any(|rule| rule == ".corp.alva.xyz"));
+            assert!(rules.split(',').any(|rule| rule == "localhost"));
+            if existing.contains("example.com") {
+                assert!(rules.split(',').any(|rule| rule == "example.com"));
+            }
+        }
+    }
+
+    #[test]
     fn upload_deadline_includes_a_full_stdin_pipe() {
         let child = std::process::Command::new("python3")
             .args(["-c", "import time; time.sleep(30)"])
@@ -532,6 +560,10 @@ pub fn install(host: &str) -> Result<(), String> {
         (
             "supervisor.mjs",
             include_str!("../../bridge/supervisor.mjs"),
+        ),
+        (
+            "tool_queries.py",
+            include_str!("../../bridge/tool_queries.py"),
         ),
         ("supervisor.py", include_str!("../../bridge/supervisor.py")),
         (

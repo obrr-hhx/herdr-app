@@ -707,3 +707,25 @@ blocked, paused, completed and disconnected cases are excluded; unknown delivery
 is not replayed. Replies feed the existing goal-progress/continuation workflow.
 
 目标卡片的“删除目标”需要再次确认，可取消。删除后停止该目标的后续跟进与派发，保留会话、历史、审计及已发送回执；已派发的工作不会被终止。旧后台更新不能恢复已删除的目标。
+
+### Faithful worker assignments
+
+Goal dispatch includes the verified original human messages in chronological order, followed by concise manager context and the expected result. Later human corrections take precedence. Manager-authored scope/exclusion summaries are not appended as operational restrictions, and there is no fixed approval disclaimer on every assignment. Exclusions may be empty when the human stated none. The manager must not invent execution-method restrictions or prerequisites; workers apply their actual capabilities and repository instructions. Exact-session binding, action grants, dependency checks and once-only delivery remain enforced. Direct assignments use the same distinction between human wording and manager context.
+
+### Slow storage and startup recovery
+
+Each conversation holds an OS-level exclusive lock before accessing its journal, preventing concurrent service startups from corrupting history. Native Claude control hooks allow up to 60 seconds for a durable local reply. A worker restores only accepted queued prompts with no persisted dispatch state or confirmation; stopped/error and unknown submissions are not replayed. Startup remains visible as starting until the hook arrives. Codex confirmation and reasoning activity update the thinking phase without exposing reasoning text. A human turn with no progress events for two minutes receives one notice; background checks stay quiet.
+
+
+Journal writes and fsync run in one dedicated worker thread. Events arriving together share a flush; later batches remain ordered behind the one in progress. Only the durable cursor is replayed or published, and every message acknowledgement, tool-hook reply and stdin submission waits for the corresponding durable records. Subscriptions and activity heartbeats remain responsive during a slow flush. The UI distinguishes Saving message from model execution. Storage failure pauses new dispatch and retains the local outgoing queue; it does not trigger a replay. A torn acceptance without its payload remains retryable under the original request ID. Restart recovery excludes imported history and any input with a persisted dispatch or uncertain delivery.
+
+Bridge revisions are compared separately from protocol compatibility. A new client upgrades an older worker only after the existing idle guard verifies no pending inputs, approvals, other clients, or background tasks; the service lock helper does not count as user work. Active Claude and its background commands are left running until that check is safe.
+
+
+### Bounded management queries
+
+The public MCP and Codex tool boundaries use one query layer; internal authority, question, goal and delivery checks still read full canonical records. Lists default to 8 summaries (maximum 25), support query/offset/limit and return total, next_offset and result_id. Decisions default to pending/answered; status=all explicitly includes historical cards. Session inventory no longer embeds full goals, tasks, assignments and machines: choose its collection. Inspection selects a page before reading worker histories. History searches scan at most 120 available source messages per call and retain their partial-history boundary.
+
+Use read_tool_result with the returned result_id and JSON pointer detail_path to page/search complete fields without executing the original tool again. Cached list snapshots allow stable continuation while the live source changes. Inspection pages remain live; deduplicate session addresses. Text pages are at most 2000 characters. Tool bodies are at most 12,000 UTF-8 bytes; mutation responses are at most 4000 bytes and retain actual confirmation/verification flags. Summaries/truncation are explicit and cannot stand in for a complete human question, authorization or execution result.
+
+Snapshots contain only redacted results and use private directory/file permissions. They expire after six hours and are capped at 128 files or 64 MiB total (16 MiB each). Cache failure never turns a successful mutation into a reported execution failure. Expired detail is recovered by reading canonical data, never repeating a mutation. Memory maintenance must traverse memory/feedback pages and read exact citations before consolidation.

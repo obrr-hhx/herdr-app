@@ -36,7 +36,7 @@ export function codexRunner(folder,cwd,callbacks,settings={}){
   if(m.method==='item/tool/call'&&m.id!==undefined){
    try{
     if(readOnlyTurn(command?.request_id)&&!readOnlyTool(m.params.tool,command?.request_id)){write({id:m.id,result:{contentItems:[{type:'inputText',text:'Session inspections are read-only; wait for explicit human authority.'}],success:false}});return;}
-    callbacks.tool(m.params.callId,m.params.tool,m.params.arguments);
+    await callbacks.tool(m.params.callId,m.params.tool,m.params.arguments);
     const result=await toolProcess(['--call',m.params.tool,JSON.stringify(m.params.arguments)]);
     callbacks.toolResult(m.params.callId,result.value,!result.ok);
     write({id:m.id,result:{contentItems:[{type:'inputText',text:JSON.stringify(result.value)}],success:result.ok}});
@@ -45,6 +45,8 @@ export function codexRunner(folder,cwd,callbacks,settings={}){
   if(m.id!==undefined&&m.method){write({id:m.id,error:{code:-32601,message:'This manager only executes session management tools. Ask the user in chat.'}});return;}
   const p=m.params??{};
   if(p.threadId&&thread&&p.threadId!==thread)return;
+  // Activity metadata only: reasoning text stays private to Codex.
+  if(m.method==='turn/started'||m.method?.startsWith('item/reasoning/'))callbacks.progress?.('thinking');
   if(m.method==='item/agentMessage/delta'){const index=pieces.get(p.itemId)??0;pieces.set(p.itemId,index+1);callbacks.delta('codex:'+p.itemId,index,p.delta);}
   if(m.method==='item/completed'&&p.item?.type==='agentMessage')callbacks.complete('codex:'+p.item.id);
   if(m.method==='turn/completed'){turn='';command=null;if(p.turn?.status==='failed')callbacks.failure(`Codex turn failed (${lastError}). Check account availability and connection.`);else callbacks.done();}

@@ -31,6 +31,16 @@ class Coordinator(unittest.TestCase):
    self.assertEqual(m.call('create_session',args)['address'],'chat:new-pane')
    self.assertEqual(install.call_count,1)
   self.assertEqual(sum(n=='supervisor.create' for n,a in self.calls),1)
+ def test_bridge_install_failure_and_timeout_never_create_or_poison_worker(self):
+  from unittest.mock import patch
+  from subprocess import CompletedProcess,TimeoutExpired
+  args={'agent':'claude','host':'old-vm','folder':'/home/forge/project','title':'Worker','request_id':'failed-host-install'}
+  for outcome in [CompletedProcess([],255,'',''),TimeoutExpired('install',30)]:
+   kw={'side_effect':outcome} if isinstance(outcome,Exception) else {'return_value':outcome}
+   with patch.object(m,'configured_ssh_host',return_value=True),patch.object(m.subprocess,'run',**kw):
+    with self.assertRaisesRegex(m.Refused,'before session creation'):m.call('create_session',args)
+   c=m.db();self.assertIsNone(c.execute('SELECT id FROM sends WHERE id=?',(args['request_id'],)).fetchone());c.close()
+  self.assertFalse(any(name=='supervisor.create' for name,a in self.calls))
  def test_unknown_host_refusal_does_not_poison_creation_request(self):
   from unittest.mock import patch
   from subprocess import CompletedProcess
@@ -207,5 +217,5 @@ class Coordinator(unittest.TestCase):
   with self.assertRaises(ValueError):m.call('send_message',{'address':'chat:p','text':text,'request_id':'credential-test-01'})
  def test_mcp_only_exposes_management_tools(self):
   names=[x['name'] for x in m.handle({'method':'tools/list'})['tools']]
-  self.assertEqual(names,['plan_followup','get_checkin_settings','configure_checkins','list_sessions','inspect_sessions','read_session','send_message','close_session','release_session','create_session','reply_to_question','schedule_reminder','list_reminders','cancel_reminder','acknowledge_reminder','list_decisions','record_decision','curate_decision','record_task','list_goals','record_goal','record_goal_progress','ask_goal_session','plan_goal_followup','advance_goal','search_memories','list_memories','read_memory','review_memories','consolidate_memories','record_memory','forget_memory'])
+  self.assertEqual(names,['plan_followup','get_checkin_settings','configure_checkins','list_sessions','inspect_sessions','read_session','send_message','close_session','release_session','create_session','reply_to_question','schedule_reminder','list_reminders','cancel_reminder','acknowledge_reminder','list_decisions','record_decision','curate_decision','record_task','list_goals','record_goal','record_goal_progress','ask_goal_session','plan_goal_followup','advance_goal','search_memories','list_memories','read_memory','review_memories','consolidate_memories','record_memory','forget_memory','read_tool_result'])
 if __name__=='__main__':unittest.main()

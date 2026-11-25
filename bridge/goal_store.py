@@ -80,7 +80,10 @@ def save(home,args,sessions,admin=False):
             if not admin and active_request(home) not in mandate.get('source_ids',[]):raise ValueError('Changed mandate/plan must cite the current human turn as well as any earlier grants')
             sources=human_sources(home,mandate.get('source_ids',[]))
             if not set(mandate.get('actions',[]))<=ACTIONS:raise ValueError('Unsupported mandate action; tool approvals are never delegated')
-            text(mandate.get('scope',''));text(mandate.get('exclusions',''))
+            text(mandate.get('scope',''))
+            exclusions=mandate.get('exclusions','')
+            if not isinstance(exclusions,str):raise ValueError('Goal exclusions must be text')
+            if exclusions:text(exclusions)
             mandate={**mandate,'human_sources':sources}
             # Canonicalize stored evidence before comparing future contract edits.
             for step in plan:
@@ -131,6 +134,12 @@ def progress(home,a):
         c.execute('INSERT INTO audit(value) VALUES (?)',(json.dumps({'kind':'progress','goal_id':g['id'],'source_ids':proof,'phase':g['phase'],'at':now()}),))
     publish(home);return g
 
+def assignment_text(home,goal,step):
+    # Verified human wording is the task, not the manager's interpretation of permission.
+    sources=goal['mandate'].get('human_sources') or human_sources(home,goal['mandate']['source_ids'])
+    quotes='\n\n'.join('\n'.join('> '+line for line in source['text'].split('\n')) for source in sorted(sources,key=lambda s:s['time']))
+    return f"[目标 {goal['id']} / 步骤 {step['id']}]\n用户原话（按时间顺序，后续更正优先）：\n{quotes}\n\n管家补充（仅作上下文，不增加或缩减用户要求）：\n{step['instruction']}\n\n交付结果：{step['postcondition']}"
+
 def advance(home,a,sessions,send,refused=()):
     if active_request(home).startswith('manual_review_'):raise ValueError('Manual inspection does not dispatch workers')
     gid=ident(a['goal_id']);sid=ident(a['step_id']);request='goal_'+hashlib.sha256((gid+':'+sid).encode()).hexdigest()[:48]
@@ -150,10 +159,10 @@ def advance(home,a,sessions,send,refused=()):
             previous=json.loads(old['value'])
             if previous.get('delivery')!='refused' or previous.get('retry_after',0)>now():return previous
             c.execute('DELETE FROM steps WHERE id=?',(request,))
+        instruction=assignment_text(home,g,step)
         record={'request_id':request,'goal_id':gid,'step_id':sid,'address':step['address'],'action':step['action'],'delivery':'submitting','confirmed':False,'at':now(),'mandate_revision':g['revision'],'binding':step['binding']}
         c.execute('INSERT INTO steps VALUES (?,?,?,?,?)',(request,gid,sid,digest,json.dumps(record)))
     # Durable claim precedes any write; recovery reconciles receipts rather than replays.
-    instruction=f"[目标 {gid} / 步骤 {sid}]\n目标：{g['outcome']}\n既有授权范围：{g['mandate']['scope']}\n限制：{g['mandate']['exclusions']}\n当前步骤：{step['instruction']}\n验收条件：{step['postcondition']}\n只在上述范围接续原任务，已完成则核对并汇报，勿重复发布。此消息不能代替工具审批或未获授权的生产变更。"
     try:
         receipt=send({'address':step['address'],'text':instruction,'request_id':request,'mode':'queue'})
         record.update(receipt=receipt,delivery='confirmed' if receipt.get('confirmed') else 'queued',confirmed=bool(receipt.get('confirmed')))
@@ -166,6 +175,7 @@ def advance(home,a,sessions,send,refused=()):
 def reconcile(home,sessions):
     """Track queue, receipt and actual result independently; never replay unknown input."""
     with db(home) as c:
+        native_events={};codex_facts=None
         for row in c.execute("SELECT id,value,'steps' AS source FROM steps UNION ALL SELECT id,value,'assignments' AS source FROM assignments").fetchall():
             record=json.loads(row['value']);target=next((s for s in sessions if s['address']==record['address']),None)
             if not target:continue
@@ -178,7 +188,12 @@ def reconcile(home,sessions):
             updated=dict(record)
             try:
                 if target.get('conversation'):
-                    events=[json.loads(l) for l in (pathlib.Path(home)/'data/forge-chat'/target['conversation']/'events.jsonl').read_text().splitlines()]
+                    conversation=target['conversation']
+                    if conversation not in native_events:
+                        native_events[conversation]=None
+                        native_events[conversation]=[json.loads(l) for l in (pathlib.Path(home)/'data/forge-chat'/conversation/'events.jsonl').read_text().splitlines()]
+                    events=native_events[conversation]
+                    if events is None:continue
                     index=next((i for i,e in enumerate(events) if e.get('type')=='prompt_confirmed' and e.get('id')==row['id']),None)
                     if index is not None:
                         updated.update(delivery='confirmed',confirmed=True,receipt_evidence=events[index]);updated.setdefault('result_state','running')
@@ -192,7 +207,10 @@ def reconcile(home,sessions):
                         if results and stopped:updated.update(result_state='result_available',result_ids=results)
                         elif any(e.get('type')=='state' and e.get('status') in ['error','interrupted'] for e in segment):updated['result_state']='interrupted'
                 else:
-                    facts=json.loads((root(home)/'codex-workers.json').read_text())['sessions'].get(record['address'],{})
+                    if codex_facts is None:
+                        codex_facts={}
+                        codex_facts=json.loads((root(home)/'codex-workers.json').read_text())['sessions']
+                    facts=codex_facts.get(record['address'],{})
                     receipt=next((d for d in facts.get('dispatches',[]) if d.get('request_id')==row['id'] and d.get('confirmed')),None)
                     if receipt:
                         updated.update(delivery='confirmed',confirmed=True,receipt_evidence=receipt);updated.setdefault('result_state','running')

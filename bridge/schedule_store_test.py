@@ -19,6 +19,20 @@ class Reminders(unittest.TestCase):
     def create(self,**kw):
         return m.create(self.home,{**self.args,**kw},self.intent,self.clock)
 
+    def test_query_source_does_not_silently_hide_reminders_after_five_hundred(self):
+        import json
+        from tool_queries import invoke
+        self.create();c=m.connect(self.home)
+        try:
+            template=dict(c.execute('SELECT * FROM schedules LIMIT 1').fetchone())
+            with c:
+                for i in range(500):
+                    payload=json.loads(template['payload']);payload['id']=f'older-{i}'
+                    c.execute('INSERT INTO schedules VALUES (?,?,?,?)',(f'older-{i}',json.dumps(payload),template['next_at']-i-1,template['state']))
+        finally:c.close()
+        result=invoke(self.home,'list_reminders',{'query':'older-499'},lambda name,args:m.listing(self.home))
+        self.assertEqual(result['collection_total'],501);self.assertEqual(result['total'],1);self.assertEqual(result['schedules'][0]['id'],'older-499')
+
     def test_exact_timezone_and_due_boundary_survive_restart(self):
         r=self.create();self.assertEqual(r['next_local'],self.args['at'])
         self.assertEqual(m.poll(self.home,clock=self.due-1,notify=lambda *_:True)['deliveries'],[])

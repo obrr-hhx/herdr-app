@@ -86,7 +86,7 @@ def create(home, args, intent, clock=None):
 def listing(home, timezone="Asia/Shanghai"):
     c=connect(home)
     try:
-        schedules=[public(r) for r in c.execute('SELECT * FROM schedules ORDER BY next_at DESC LIMIT 500')]
+        schedules=[public(r) for r in c.execute('SELECT * FROM schedules ORDER BY next_at DESC')]
         pending=[dict(r) for r in c.execute('SELECT id,schedule_id,due_at FROM reminder_deliveries WHERE seen_at IS NULL ORDER BY due_at')]
         return {'schedules':schedules,'unread_reminders':pending,'now':now_ms(),'now_local':dt.datetime.now(ZoneInfo(timezone)).isoformat(),'timezone':timezone}
     finally:

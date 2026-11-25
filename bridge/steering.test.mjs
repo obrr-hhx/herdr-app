@@ -32,7 +32,7 @@ while True:
  try{
   for(let i=0;i<100&&!fs.existsSync(root+'/run.sock');i++)await delay(20);
   socket=net.createConnection(root+'/run.sock');socket.setEncoding('utf8');let buffer='';socket.on('data',chunk=>{buffer+=chunk;let n;while((n=buffer.indexOf('\n'))>=0){seen.push(JSON.parse(buffer.slice(0,n)));buffer=buffer.slice(n+1);}});socket.on('error',()=>{});const send=c=>socket.write(JSON.stringify(c)+'\n');
-  send({action:'subscribe',after:0});await wait(e=>e.type==='connected');const sid=seen.find(e=>e.type==='session').session_id;
+  send({action:'subscribe',after:0});await wait(e=>e.type==='connected');await wait(e=>e.type==='session');const sid=seen.find(e=>e.type==='session').session_id;
   const png=Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+j4l8AAAAASUVORK5CYII=','base64'),image=crypto.createHash('sha256').update(png).digest('hex');fs.mkdirSync(root+'/images');fs.writeFileSync(root+'/images/'+image+'.png',png);
   const original='original\n看看截图';
   send({action:'send',request_id:'original-turn-id',text:original,images:[image]});await wait(e=>e.type==='prompt_confirmed'&&e.id==='original-turn-id');await wait(e=>e.type==='capabilities'&&e.capabilities.includes('steer'));

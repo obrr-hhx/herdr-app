@@ -6,7 +6,7 @@ import sys
 folder = sys.argv[1]
 event = json.load(sys.stdin)
 s = socket.socket(socket.AF_UNIX)
-s.settimeout(605 if event['hook_event_name'] in ('PermissionRequest', 'PreToolUse') else 5)
+s.settimeout(605 if event['hook_event_name'] in ('PermissionRequest', 'PreToolUse') else 60)
 try:
     s.connect(folder + '/run.sock')
     s.sendall((json.dumps({'action': 'hook', 'event': event}) + '\n').encode())

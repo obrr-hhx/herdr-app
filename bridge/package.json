@@ -1,1 +1,1 @@
-{"name":"herdr-forge-chat-bridge","version":"0.1.0","private":true,"type":"module","scripts":{"test":"node --test"}}
+{"name":"herdr-forge-chat-bridge","version":"0.1.0","private":true,"type":"module","scripts":{"test":"node --test --test-concurrency=1"}}

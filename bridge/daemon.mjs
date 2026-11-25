@@ -14,15 +14,35 @@ import crypto from 'node:crypto';
 import {spawn} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
 import {imagePaths} from './images.mjs';
-import {Journal} from './journal.mjs';
+import {Journal,unstartedPrompts} from './journal.mjs';
 import {Display} from './display.mjs';
 import {importTranscript,assertInactive} from './import.mjs';
 import {workspace,validSettings} from './workspace.mjs';
 import {statusLineConfig} from './statusline.mjs';
 const [folder,requestedCwd,model='opus',resume='']=process.argv.slice(2);
 const cwd=fs.realpathSync(requestedCwd);
+const bridgeRevision=crypto.createHash('sha256').update(fs.readFileSync(fileURLToPath(import.meta.url))).update(fs.readFileSync(new URL('./journal.mjs',import.meta.url))).digest('hex');
 if(!folder||!path.isAbsolute(cwd))process.exit(2);
-const journal=new Journal(folder);const existing=journal.events.length>0;
+// Hold an OS lock before reading or writing the journal, even when startup is slow.
+fs.mkdirSync(folder,{recursive:true,mode:0o700});
+const owner=spawn('python3',['-u','-c',`import os,sys
+f=open(sys.argv[1],'a+b')
+if os.name=='nt':
+ import msvcrt
+ f.write(b'0');f.flush();f.seek(0);msvcrt.locking(f.fileno(),msvcrt.LK_NBLCK,1)
+else:
+ import fcntl
+ fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB)
+print('ready',flush=True);sys.stdin.buffer.read()
+`,folder+'/daemon.lock'],{stdio:['pipe','pipe','ignore']});
+await new Promise(resolve=>{owner.once('error',()=>process.exit(1));owner.once('exit',()=>process.exit(1));owner.stdout.once('data',()=>resolve());});
+process.on('exit',()=>owner.kill());
+let storageFailed=false;
+const publish=events=>{for(const e of events){const line=JSON.stringify(e)+'\n';for(const p of peers){if(p.writableLength>8*1024*1024)p.destroy();else p.write(line);}}};
+const journal=new Journal(folder,{async:true,onCommit:publish,onError:()=>{
+ storageFailed=true;ready=false;status='error';progress('storage_error');
+ for(const p of peers)p.write(JSON.stringify({type:'notice',message:'消息记录未能可靠保存，执行已暂停；本地待发送消息仍保留，请勿重复发送。'})+'\n');
+}});const existing=journal.events.length>0;
 if(resume)importTranscript(journal,resume);
 const peers=new Set(),pending=new Map();
 const session=journal.events.findLast(e=>e.type==='session')?.session_id??crypto.randomUUID();
@@ -37,8 +57,12 @@ const manager=process.env.HERDR_SUPER_AGENT==='1';
 let claudeMemoryVersion=null;
 if(manager&&!runtime.provider)runtime={model:'default',effort:'',provider:'codex'};
 let reminderClock=null,codexWorkers=null,checkinClock=null,memoryClock=null,checkinDecision=null,checkinOutput=[];
-const emit=(type,data={})=>{if(memoryTurn(turnRequestId)&&['delta','message_complete','tool','tool_result'].includes(type))return null;if(turnRequestId?.startsWith('observe_')&&['delta','message_complete','tool','tool_result'].includes(type)){if(checkinDecision?.publish===false)return null;if(!checkinDecision){checkinOutput.push([type,data]);return null;}}const e=journal.append(type,data),line=JSON.stringify(e)+'\n';for(const p of peers){if(p.writableLength>8*1024*1024)p.destroy();else p.write(line);}return e;};
-if(existing)emit('state',{status:'interrupted',message:'Service restarted. Previously accepted prompts were not automatically submitted again.'});
+const emit=(type,data={})=>{if(storageFailed)return null;if(memoryTurn(turnRequestId)&&['delta','message_complete','tool','tool_result'].includes(type))return null;if(turnRequestId?.startsWith('observe_')&&['delta','message_complete','tool','tool_result'].includes(type)){if(checkinDecision?.publish===false)return null;if(!checkinDecision){checkinOutput.push([type,data]);return null;}}return journal.append(type,data);};
+if(existing){
+ const restored=unstartedPrompts(journal.events);queue.push(...restored);
+ if(restored.length)emit('startup_queue_restored',{request_ids:restored.map(c=>c.request_id)});
+}
+if(existing)emit('state',{status:queue.length?'starting':'interrupted',message:'Service restarted. Previously submitted or uncertain prompts were not automatically submitted again.'});
 if(existing)finishReviews('interrupted');
 if(existing)for(const id of unconfirmedSteering(journal.events))emit('dispatch_receipt',{id,mode:'steer',stage:'unknown',reason:'Bridge restarted before Claude confirmed this input. Inspect the same session; it was not replayed.'});
 emit('session',{session_id:session,model,backend:'interactive'});
@@ -58,13 +82,18 @@ for(const e of [...journal.events]){
 }
 for(const id of oldPending)emit('permission_resolved',{id,decision:'cancelled'});
 function capabilities(){return ['workspace','settings','compact','images',...(!manager&&steerSupported?['steer']:[]),...(manager?['session_review']:[])];}
-function activity(){return {active_turn:turnRequestId,phase,last_progress:lastProgress,tool:lastTool,permission_mode:manager?'managementTools':permissionMode};}
+function activity(){return {active_turn:turnRequestId,phase,last_progress:lastProgress,tool:lastTool,permission_mode:manager?'managementTools':permissionMode,persistence:{durable_seq:journal.durableSeq,pending_events:journal.events.length-journal.durableSeq}};}
 function progress(next,tool=''){lastProgress=Date.now();phase=next;lastTool=tool;}
 function finishReviews(outcome){for(const e of journal.events.filter(e=>e.type==='review_requested'))if(!journal.events.some(r=>r.type==='review_complete'&&r.id===e.id))emit('review_complete',{id:e.id,outcome});}
 function state(s){status=s;if(['error','interrupted','interrupting'].includes(s))finishReviews(s);if(s!=='working')progress(s);if((memoryTurn(turnRequestId)||turnRequestId?.startsWith('observe_')&&!checkinDecision?.publish)&&s==='working')return;emit('state',{status:s,active_turn:turnRequestId});}
-const activityTimer=setInterval(()=>{for(const p of peers)if(p.writableLength<1024*1024)p.write(JSON.stringify({type:'activity',...activity()})+'\n');},5000);activityTimer.unref();
+let noProgressNoticeTurn=null;
+const activityTimer=setInterval(()=>{if(manager&&runtime.provider==='codex'&&busy&&turnRequestId&&!turnRequestId.startsWith('observe_')&&noProgressNoticeTurn!==turnRequestId&&Date.now()-lastProgress>120000){noProgressNoticeTurn=turnRequestId;emit('notice',{message:'Codex 已接收输入，但超过 2 分钟暂无新的进展事件。可用停止按钮结束本轮等待，工作会话仍保留。'});}for(const p of peers)if(p.writableLength<1024*1024)p.write(JSON.stringify({type:'activity',...activity()})+'\n');},5000);activityTimer.unref();
 function cancelPermissions(){for(const [id,p]of pending){p.reply('deny');clearTimeout(p.timer);emit('permission_resolved',{id,decision:'cancelled'});}pending.clear();}
-function dispatch(){if(!cli||!ready||busy||!queue.length)return;while(queue.length&&(!checkinStillValid(process.env.HERDR_APP_HOME??'',journal,queue[0])||memoryTurn(queue[0].request_id)&&journal.events.some(e=>e.type==='user'&&e.time>(journal.events.findLast(v=>v.type==='observation'&&v.id===queue[0].request_id)?.time??0)))){const skipped=queue.shift();emit('observation_complete',{id:skipped.request_id,skipped:'newer_human_or_disabled'});}if(!queue.length)return;current=queue.shift();turnRequestId=current.request_id;if(manualReviewId(turnRequestId))emit('review_started',{id:turnRequestId});checkinDecision=null;checkinOutput=[];goalReviewTools.clear();busy=true;progress('submitting');state('working');if(manager){const dir=path.join(process.env.HERDR_APP_HOME,'data/super-agent');fs.mkdirSync(dir,{recursive:true});fs.writeFileSync(path.join(dir,'active-observation.json'),JSON.stringify({id:turnRequestId,socket:folder+'/run.sock',cursor:journal.events.length}),{mode:0o600});}if(manager)current.memory_snapshot=memorySnapshot(process.env.HERDR_APP_HOME);cli.stdin.write(JSON.stringify({...current,action:'send',image_paths:imagePaths(folder,current.images)})+'\n');const id=current.request_id;const timer=setTimeout(()=>{if(current?.request_id===id)emit('notice',{message:'消息已到远程，但 Claude 尚未确认输入；尚不能视为开始处理，请勿重复发送。'});},15000);timer.unref();}
+async function dispatch(){if(storageFailed||shuttingDown||!cli||!ready||busy||!queue.length)return;while(queue.length&&(!checkinStillValid(process.env.HERDR_APP_HOME??'',journal,queue[0])||memoryTurn(queue[0].request_id)&&journal.events.some(e=>e.type==='user'&&e.time>(journal.events.findLast(v=>v.type==='observation'&&v.id===queue[0].request_id)?.time??0)))){const skipped=queue.shift();emit('observation_complete',{id:skipped.request_id,skipped:'newer_human_or_disabled'});}if(!queue.length)return;current=queue.shift();turnRequestId=current.request_id;if(manualReviewId(turnRequestId))emit('review_started',{id:turnRequestId});checkinDecision=null;checkinOutput=[];goalReviewTools.clear();busy=true;progress('submitting');state('working');if(manager){const dir=path.join(process.env.HERDR_APP_HOME,'data/super-agent');fs.mkdirSync(dir,{recursive:true});fs.writeFileSync(path.join(dir,'active-observation.json'),JSON.stringify({id:turnRequestId,socket:folder+'/run.sock',cursor:journal.events.length}),{mode:0o600});}if(manager)current.memory_snapshot=memorySnapshot(process.env.HERDR_APP_HOME);
+ const command=current,backend=cli;progress('saving');
+ try{await journal.flush();}catch{return;}
+ if(shuttingDown||storageFailed||!busy||!ready||current!==command||cli!==backend)return;
+ progress('submitting');cli.stdin.write(JSON.stringify({...current,action:'send',image_paths:imagePaths(folder,current.images)})+'\n');const id=current.request_id;const timer=setTimeout(()=>{if(current?.request_id===id)emit('notice',{message:'消息已到远程，但 Claude 尚未确认输入；尚不能视为开始处理，请勿重复发送。'});},15000);timer.unref();}
 function commitFollowup(args,allowGap=false){
  if(isGoalReview(turnRequestId)&&!allowGap&&(!goalReviewTools.has('list_goals')||!['inspect_sessions','read_session'].some(t=>goalReviewTools.has(t))))throw Error('Before publishing a goal review, read list_goals and attempt fresh inspect_sessions/read_session evidence. Report any observation gaps explicitly.');
  let snapshot={sessions:[]};try{snapshot=JSON.parse(fs.readFileSync(path.join(process.env.HERDR_APP_HOME,'data/super-agent/sessions.json'),'utf8'));}catch{}
@@ -89,34 +118,46 @@ function start(){
    models:models=>{codexModels=models;emit('models',{provider:'codex',models});},
    ready:model=>{Object.assign(runtime,{model});ready=true;emit('settings',{...runtime,applied:true});state('idle');dispatch();},
    notice:message=>emit('notice',{message}),
-   confirmed:id=>{emit('prompt_confirmed',{id});if(current?.request_id===id)current=null;},
+   confirmed:id=>{emit('prompt_confirmed',{id});if(turnRequestId===id)progress('thinking');if(current?.request_id===id)current=null;},
+   progress:next=>progress(next),
    delta:(id,index,text)=>{progress('responding');emit('delta',{id,index,text,kind:'text_delta'});},
    complete:id=>emit('message_complete',{id}),
-   tool:(id,name,input)=>{markReviewTool(name);progress('tool',name);emit('tool',{id,name,input});},
+   tool:async(id,name,input)=>{markReviewTool(name);progress('tool',name);emit('tool',{id,name,input});await journal.flush();},
    toolResult:(id,content,is_error)=>emit('tool_result',{id,content,is_error}),
-   done:()=>{completeObservation();busy=false;current=null;state('idle');setTimeout(dispatch,300);},
+   done:()=>{completeObservation();busy=false;ready=!storageFailed;current=null;state('idle');setTimeout(dispatch,300);},
    failure:(message,fatal=false)=>{ready=!fatal;busy=false;current=null;queue=[];state('error');emit('notice',{message});},
    usage:u=>emit('statusline',{model:runtime.model,updated_at:Date.now(),input_tokens:u.last.inputTokens,output_tokens:u.last.outputTokens,cache_read_tokens:u.last.cachedInputTokens,context_size:u.modelContextWindow,context_pct:u.modelContextWindow?100*u.last.totalTokens/u.modelContextWindow:null}),
   },runtime);
   cli.on('exit',()=>{cli=null;ready=false;busy=false;current=null;if(shuttingDown)return;if(restarting){restarting=false;start();}else {queue=[];state('interrupted');emit('notice',{message:'Codex stopped. Send a new prompt to resume; previous prompts were not automatically retried.'});}});return;
  }
  try{assertInactive(session);}catch{queue=[];state('error');emit('notice',{message:'This Claude conversation is still running in another terminal. No prompt was submitted; finish the handover before retrying.'});return;}
- ready=false;
+ ready=false;state('starting');
  const command=`python3 ${quote(fileURLToPath(new URL('./hook.py',import.meta.url)))} ${quote(folder)}`;
- const hooks=Object.fromEntries(['PreCompact','SessionStart','UserPromptSubmit','MessageDisplay','PreToolUse','PermissionRequest','PostToolUse','PostToolUseFailure','Stop','StopFailure','SessionEnd'].map(e=>[e,[{hooks:[{type:'command',command,timeout:['PermissionRequest','PreToolUse'].includes(e)?600:5}]}]]));
+ const hooks=Object.fromEntries(['PreCompact','SessionStart','UserPromptSubmit','MessageDisplay','PreToolUse','PermissionRequest','PostToolUse','PostToolUseFailure','Stop','StopFailure','SessionEnd'].map(e=>[e,[{hooks:[{type:'command',command,timeout:['PermissionRequest','PreToolUse'].includes(e)?600:60}]}]]));
  fs.writeFileSync(folder+'/settings.json',JSON.stringify({hooks,statusLine:statusLineConfig(folder)}),{mode:0o600});
  cli=spawn('python3',[fileURLToPath(new URL('./runner.py',import.meta.url)),folder,cwd,runtime.model,session,runtime.effort??''],{stdio:['pipe','pipe','ignore']});
+ const startingCli=cli;const startupTimer=setTimeout(()=>{if(cli===startingCli&&!ready&&!shuttingDown)emit('notice',{message:'Claude 启动回执尚未到达，消息仍在队列中；正在等待执行服务就绪。'});},15000);startupTimer.unref();
  cli.on('error',()=>{cli=null;state('error');});
  cli.stdin.on('error',()=>{ready=false;state('error');});
  readline.createInterface({input:cli.stdout}).on('line',line=>{try{const e=JSON.parse(line);if(e.type==='capabilities'){steerSupported=e.steer===true;emit('capabilities',{capabilities:capabilities()});}if(e.type==='authentication_failed')emit('notice',{message:'Local Claude subscription token is unavailable. Check the configured SSH auth host or sign in with Claude Code.'});if(e.type==='rejected')emit('notice',{message:'Prompt contains unsupported terminal control characters.'});if(e.type==='command_failed'){if(current){emit('prompt_confirmed',{id:current.request_id});current=null;}busy=false;queue=[];state('idle');emit('notice',{message:e.reason==='slash_unavailable'?'Claude did not recognize this project command. Refresh the command list or check its installation.':'Claude could not compact this conversation. Its existing history is kept.'});}}catch{}});
  cli.on('exit',()=>{cli=null;ready=false;busy=false;cancelPermissions();if(shuttingDown)return;if(restarting){restarting=false;start();return;}queue=[];state('interrupted');emit('notice',{message:'Interactive Claude stopped. Connect and send a new prompt to resume; earlier prompts are not automatically retried.'});});
 }
 function quote(s){return "'"+s.replaceAll("'","'\\''")+"'";}
+function failedHook(event,socket){
+ if(socket.destroyed)return;
+ let output;
+ if(event?.hook_event_name==='PermissionRequest')output={hookSpecificOutput:{hookEventName:event.hook_event_name,decision:{behavior:'deny',message:'Message journal unavailable'}}};
+ else if(event?.hook_event_name==='PreToolUse')output={hookSpecificOutput:{hookEventName:event.hook_event_name,permissionDecision:'deny',permissionDecisionReason:'Message journal unavailable'}};
+ else{socket.destroy();return;}
+ socket.end(JSON.stringify({type:'hook_ack',output})+'\n');
+}
 function hook(c,socket){
  // cwd follows the interactive CLI's cd commands; the session ID and private
  // socket identify its owner, while the launch directory remains unchanged.
  const e=c.event;if(!e||e.session_id!==session||typeof e.cwd!=='string'||!path.isAbsolute(e.cwd))throw Error('wrong_session');
- const reply=output=>{if(!socket.destroyed)socket.end(JSON.stringify({type:'hook_ack',...(output?{output}:{})})+'\n');};
+ const reply=output=>{Promise.resolve().then(()=>journal.flush()).then(()=>{if(!socket.destroyed)socket.end(JSON.stringify({type:'hook_ack',...(output?{output}:{})})+'\n');}).catch(()=>{
+ failedHook(e,socket);
+ });};
  const name=e.hook_event_name;
  if(name==='PreToolUse')markReviewTool(e.tool_name);
  if(!manager&&['default','plan','acceptEdits','bypassPermissions','auto'].includes(e.permission_mode))permissionMode=e.permission_mode;
@@ -133,7 +174,7 @@ function hook(c,socket){
  if(name==='MessageDisplay'){progress('responding');display.accept(e);reply();return;}
  if(name==='PreCompact'){cli?.stdin.write(JSON.stringify({action:'prompt_confirmed'})+'\n');state('working');reply();return;}
  if(name==='SessionStart'){claudeMemoryVersion=null;if(current&&/^\/compact(?:\s|$)/.test(current.text??'')){emit('prompt_confirmed',{id:current.request_id});current=null;busy=false;}reply();setTimeout(()=>{ready=true;emit('settings',{...runtime,applied:true});state('idle');dispatch();},400);return;}
- if(name==='UserPromptSubmit'){const memory=current?.memory_snapshot??(manager?memorySnapshot(process.env.HERDR_APP_HOME):null);const steered=steering.confirm(e.prompt);if(steered)emit('prompt_confirmed',{id:steered.request_id,mode:'steer'});progress('thinking');cli?.stdin.write(JSON.stringify({action:'prompt_confirmed'})+'\n');fs.writeFileSync(folder+'/has-session','1',{mode:0o600});if(current){emit('prompt_confirmed',{id:current.request_id});current=null;}if(manager){const ver=memory?.version??'unavailable';if(claudeMemoryVersion!==ver){claudeMemoryVersion=ver;reply({hookSpecificOutput:{hookEventName:name,additionalContext:memory?.summary??'Memory unavailable. Verify old preferences with list_memories/read_memory before using them.'}});return;}}reply();return;}
+ if(name==='UserPromptSubmit'){const memory=current?.memory_snapshot??(manager?memorySnapshot(process.env.HERDR_APP_HOME):null);const steered=steering.confirm(e.prompt);if(steered)emit('prompt_confirmed',{id:steered.request_id,mode:'steer'});progress('thinking');cli?.stdin.write(JSON.stringify({action:'prompt_confirmed'})+'\n');if(current){emit('prompt_confirmed',{id:current.request_id});current=null;}if(manager){const ver=memory?.version??'unavailable';if(claudeMemoryVersion!==ver){claudeMemoryVersion=ver;reply({hookSpecificOutput:{hookEventName:name,additionalContext:memory?.summary??'Memory unavailable. Verify old preferences with list_memories/read_memory before using them.'}});return;}}reply();return;}
  if(name==='PermissionRequest'||name==='PreToolUse'&&e.tool_name==='AskUserQuestion'){
    progress(name==='PermissionRequest'?'permission':'question',e.tool_name);
    const id=crypto.randomUUID();
@@ -153,7 +194,7 @@ function hook(c,socket){
  if(name==='PostToolUse'||name==='PostToolUseFailure'){progress('thinking');emit('tool_result',{id:e.tool_use_id,content:name==='PostToolUse'&&e.tool_name==='Read'&&/\.(png|jpe?g|webp|gif)$/i.test(e.tool_input?.file_path??'')?'Image loaded by Claude.':e.tool_response??e.error,is_error:name==='PostToolUseFailure'});}
  if(name==='StopFailure'){const uncertain=steering.cancel();if(uncertain)emit('dispatch_receipt',{id:uncertain.request_id,mode:'steer',stage:'unknown',reason:'Claude ended before confirming the steering input.'});busy=false;current=null;queue=[];cancelPermissions();state('error');const code=['rate_limit','overloaded','authentication_failed','oauth_org_not_allowed','account_on_hold','billing_error','invalid_request','model_not_found','server_error','max_output_tokens','cloud_credential_error'].includes(e.error)?e.error:'unknown';emit('notice',{message:`Claude ended the turn: ${code}. Earlier prompts were not automatically retried.`});}
  if(name==='Stop'&&steering.pending){state('working');reply();return;}
- if(name==='Stop'){completeObservation();busy=false;current=null;state('idle');setTimeout(dispatch,300);}
+ if(name==='Stop'){completeObservation();busy=false;ready=!storageFailed;current=null;state('idle');setTimeout(dispatch,300);}
  if(name==='SessionEnd'){ready=false;cancelPermissions();}
  reply();
 }
@@ -165,12 +206,13 @@ const server=net.createServer(socket=>{
  let subscribed=false,buffer='';socket.setEncoding('utf8');
  const handle=async line=>{let c;try{
    c=JSON.parse(line);
-   if(c.action==='hook'){hook(c,socket);return;}
+   if(c.action==='hook'){if(storageFailed){failedHook(c.event,socket);return;}hook(c,socket);return;}
    if(c.action==='subscribe'){
-     if(!Number.isSafeInteger(c.after)||c.after<0||c.after>journal.events.length)throw Error('cursor');
+     if(!Number.isSafeInteger(c.after)||c.after<0||c.after>journal.durableSeq)throw Error('cursor');
      for(const e of journal.after(c.after))socket.write(JSON.stringify(e)+'\n');peers.add(socket);subscribed=true;
-     socket.write(JSON.stringify({type:'connected',bridge_protocol:2,status:memoryTurn(turnRequestId)||turnRequestId?.startsWith('observe_')&&!checkinDecision?.publish?'idle':status,head:journal.events.length,pending:[...pending.keys(),...(codexWorkers?.ids()??[])],...activity(),capabilities:capabilities()})+'\n');return;
+     socket.write(JSON.stringify({type:'connected',bridge_protocol:2,bridge_revision:bridgeRevision,status:memoryTurn(turnRequestId)||turnRequestId?.startsWith('observe_')&&!checkinDecision?.publish?'idle':status,head:journal.durableSeq,pending:[...pending.keys(),...(codexWorkers?.ids()??[])],...activity(),capabilities:capabilities()})+'\n');return;
    }
+   if(storageFailed||journal.pendingBytes>16*1024*1024)throw Error('storage_backpressure');
    if(!subscribed||typeof c.request_id!=='string'||! /^[a-zA-Z0-9_-]{8,100}$/.test(c.request_id))throw Error('invalid_command');
    if(c.action==='plan_followup'&&manager){
      if(!busy||!turnRequestId?.startsWith('observe_')||c.observation_id!==turnRequestId)throw Error('inactive_observation');
@@ -178,31 +220,31 @@ const server=net.createServer(socket=>{
      let plan;
      if(existing){if(existing.after_minutes!==c.after_minutes||existing.publish!==c.publish||existing.reason!==c.reason)throw Error('already_planned');plan=existing;}
      else plan=commitFollowup(c);
-     socket.write(JSON.stringify({type:'ack',request_id:c.request_id,plan})+'\n');return;
+     await journal.flush();socket.write(JSON.stringify({type:'ack',request_id:c.request_id,plan})+'\n');return;
    }
    if(c.action==='permission'&&manager&&typeof c.id==='string'&&c.id.startsWith('codexq_')){
      if(!['allow','deny'].includes(c.decision))throw Error('decision');
      const q=codexWorkers?.get(c.id);
-     if(!q){emit('notice',{message:'Codex question is synchronizing or already resolved. No decision was sent.'});socket.write(JSON.stringify({type:'ack',request_id:c.request_id})+'\n');return;}
+     if(!q){emit('notice',{message:'Codex question is synchronizing or already resolved. No decision was sent.'});await journal.flush();socket.write(JSON.stringify({type:'ack',request_id:c.request_id})+'\n');return;}
      const result=await workerAnswer({address:q.address,question_id:c.id,answers:c.answers??{},decision:c.decision,ui:true,request_id:c.request_id});
      emit('worker_decision',{id:c.request_id,address:q.address,question_id:c.id,decision:c.decision,answers:c.answers??{}});
      emit('notice',{message:result.request_resolved?'Decision delivered to '+q.address+'; request resolved.':'Decision submitted to '+q.address+'; confirmation is pending.'});
-     codexWorkers.sync();socket.write(JSON.stringify({type:'ack',request_id:c.request_id})+'\n');return;
+     codexWorkers.sync();await journal.flush();socket.write(JSON.stringify({type:'ack',request_id:c.request_id})+'\n');return;
    }
    if(c.action==='reminder_ack'&&manager){
      if(!Array.isArray(c.ids)||c.ids.length>128||!c.ids.every(id=>typeof id==='string'&&id.length<180))throw Error('reminder_ids');
      journal.accept(c);await scheduleCall('--ack',process.env.HERDR_APP_HOME,{ids:c.ids});await reminderClock?.tick();
-     socket.write(JSON.stringify({type:'ack',request_id:c.request_id})+'\n');return;
+     await journal.flush();socket.write(JSON.stringify({type:'ack',request_id:c.request_id})+'\n');return;
    }
    if(c.action==='provider'&&manager){
      if(!['codex','claude'].includes(c.provider))throw Error('provider');
-     if(busy||pending.size||queue.length||cli&&!ready){socket.write(JSON.stringify({type:'notice',message:'Finish or stop the current turn before switching manager.'})+'\n');socket.write(JSON.stringify({type:'ack',request_id:c.request_id})+'\n');return;}
+     if(busy||pending.size||queue.length||cli&&!ready){socket.write(JSON.stringify({type:'notice',message:'Finish or stop the current turn before switching manager.'})+'\n');await journal.flush();socket.write(JSON.stringify({type:'ack',request_id:c.request_id})+'\n');return;}
      if(journal.accept(c)){
       const previous=journal.events.findLast(e=>e.type==='settings'&&e.provider===c.provider);runtime={model:previous?.model??(c.provider==='codex'?'default':'opus'),effort:previous?.effort??'',provider:c.provider};fs.writeFileSync(folder+'/manager-provider',c.provider,{mode:0o600});emit('settings',{...runtime,applied:true});
       emit('notice',{message:'Manager changed. Task ledger and worker sessions are retained; each backend keeps its own conversation context.'});
       if(cli){restarting=true;ready=false;state('starting');cli.kill('SIGTERM');}
      }
-     socket.write(JSON.stringify({type:'ack',request_id:c.request_id})+'\n');return;
+     await journal.flush();socket.write(JSON.stringify({type:'ack',request_id:c.request_id})+'\n');return;
    }
    if(!['send','interrupt','permission','workspace','configure'].includes(c.action))throw Error('unknown_action');
    if(c.action==='send'&&(typeof c.text!=='string'||(!c.text.trim()&&!c.images?.length)||Buffer.byteLength(c.text)>256*1024||/[\x00-\x08\x0b-\x1f\x7f]/.test(c.text)))throw Error('invalid_message');
@@ -211,18 +253,18 @@ const server=net.createServer(socket=>{
    if(c.action==='permission'&&!['allow','deny'].includes(c.decision))throw Error('invalid_decision');
    if(c.action==='workspace'){
      try{socket.write(JSON.stringify({type:'workspace',request_id:c.request_id,...await workspace(cwd,undefined,typeof c.query==='string'?c.query.slice(0,4096):'')})+'\n');}catch{socket.write(JSON.stringify({type:'workspace',request_id:c.request_id,files:[],commands:[],error:'Could not list remote project files.'})+'\n');}
-     socket.write(JSON.stringify({type:'ack',request_id:c.request_id})+'\n');return;
+     await journal.flush();socket.write(JSON.stringify({type:'ack',request_id:c.request_id})+'\n');return;
    }
    if(c.action==='configure'){
-     if(!(manager&&runtime.provider==='codex'?codexModels.some(m=>m.model===c.model&&(!c.effort||m.supportedReasoningEfforts?.some(e=>e.reasoningEffort===c.effort))):validSettings(c))){socket.write(JSON.stringify({type:'notice',message:'Unsupported model or reasoning effort.'})+'\n');socket.write(JSON.stringify({type:'ack',request_id:c.request_id})+'\n');return;}
-     if(busy||pending.size||queue.length||cli&&!ready){socket.write(JSON.stringify({type:'notice',message:'Wait for the current turn to finish before changing model or effort.'})+'\n');socket.write(JSON.stringify({type:'ack',request_id:c.request_id})+'\n');return;}
+     if(!(manager&&runtime.provider==='codex'?codexModels.some(m=>m.model===c.model&&(!c.effort||m.supportedReasoningEfforts?.some(e=>e.reasoningEffort===c.effort))):validSettings(c))){socket.write(JSON.stringify({type:'notice',message:'Unsupported model or reasoning effort.'})+'\n');await journal.flush();socket.write(JSON.stringify({type:'ack',request_id:c.request_id})+'\n');return;}
+     if(busy||pending.size||queue.length||cli&&!ready){socket.write(JSON.stringify({type:'notice',message:'Wait for the current turn to finish before changing model or effort.'})+'\n');await journal.flush();socket.write(JSON.stringify({type:'ack',request_id:c.request_id})+'\n');return;}
    }
    if(c.action==='send'&&c.mode==='steer'&&!journal.requests.has(c.request_id)){
      const reason=steering.refusal(c,{manager,supported:steerSupported,busy,ready:ready&&!current,approval:pending.size>0,turn:turnRequestId});
-     if(reason){journal.accept(c);emit('user',{id:c.request_id,text:c.text,images:c.images??[],mode:'steer'});emit('dispatch_receipt',{id:c.request_id,mode:'steer',stage:'refused',reason});socket.write(JSON.stringify({type:'ack',request_id:c.request_id,rejected:true})+'\n');return;}
+     if(reason){journal.accept(c);emit('user',{id:c.request_id,text:c.text,images:c.images??[],mode:'steer'});emit('dispatch_receipt',{id:c.request_id,mode:'steer',stage:'refused',reason});await journal.flush();socket.write(JSON.stringify({type:'ack',request_id:c.request_id,rejected:true})+'\n');return;}
    }
    if(journal.accept(c)){
-     const accepted=journal.events.at(-1);for(const p of peers)p.write(JSON.stringify(accepted)+'\n');
+     // The journal publishes accepted and payload together, only after fsync.
      if(c.action==='configure'){const same=runtime.model===c.model&&(runtime.effort??'')===c.effort;Object.assign(runtime,{model:c.model,effort:c.effort});emit('settings',{...runtime,applied:runtime.provider==='codex'||!cli||same});if(cli&&!same&&runtime.provider!=='codex'){restarting=true;ready=false;state('starting');cli.kill('SIGTERM');}}
      if(c.action==='send'){
        if(manualReviewId(c.request_id)&&(manualReviewId(turnRequestId)||queue.some(q=>manualReviewId(q.request_id))))emit('review_complete',{id:c.request_id,outcome:'coalesced'});
@@ -230,21 +272,23 @@ const server=net.createServer(socket=>{
         if(c.mode==='steer'){
           const paths=imagePaths(folder,c.images);const prompt=c.text+(paths.length?'\n\nAttached images (use Read to view these image files):\n'+paths.join('\n'):'');
           steering.begin(c,prompt);emit('dispatch_receipt',{id:c.request_id,mode:'steer',stage:'submitted'});
+          const backend=cli;await journal.flush();
+          if(storageFailed||shuttingDown||cli!==backend||steering.pending?.command.request_id!==c.request_id)return;
           cli.stdin.write(JSON.stringify({...c,action:'send',image_paths:paths})+'\n');
           const timer=setTimeout(()=>{if(steering.pending?.command.request_id===c.request_id)emit('dispatch_receipt',{id:c.request_id,mode:'steer',stage:'unknown',reason:'Claude has not confirmed this steering message. Inspect this session; do not resend automatically.'});},15000);timer.unref();
         }else{queue.push(c);start();dispatch();}}
      }
      if(c.action==='permission'){const p=pending.get(c.id);if(p){pending.delete(c.id);clearTimeout(p.timer);progress('tool',lastTool);p.reply(c.decision,c.answers);emit('permission_resolved',{id:c.id,decision:c.decision});}else emit('notice',{message:'This approval request has ended.'});}
-     if(c.action==='interrupt'){const cancelled=steering.cancel();if(cancelled)emit('dispatch_receipt',{id:cancelled.request_id,mode:'steer',stage:'cancelled'});queue=[];cancelPermissions();cli?.stdin.write(JSON.stringify({action:'interrupt'})+'\n');busy=false;current=null;state('interrupting');emit('notice',{message:'Stop requested. Waiting for Claude to finish interrupting.'});}
+     if(c.action==='interrupt'){const cancelled=steering.cancel();if(cancelled)emit('dispatch_receipt',{id:cancelled.request_id,mode:'steer',stage:'cancelled'});queue=[];cancelPermissions();busy=false;current=null;ready=false;state('interrupting');emit('notice',{message:'Stop requested. Waiting for Claude to finish interrupting.'});const backend=cli;await journal.flush();if(cli===backend&&!storageFailed)cli?.stdin.write(JSON.stringify({action:'interrupt'})+'\n');}
    }
-   socket.write(JSON.stringify({type:'ack',request_id:c.request_id})+'\n');
- }catch{socket.write(JSON.stringify({type:'command_error',request_id:c?.request_id??'',message:'Command could not be accepted. Your outgoing command is retained; inspect the connection before retrying.'})+'\n');}};
+   await journal.flush();socket.write(JSON.stringify({type:'ack',request_id:c.request_id})+'\n');
+ }catch{if(!socket.destroyed)socket.write(JSON.stringify({type:'command_error',request_id:c?.request_id??'',message:'Command could not be accepted. Your outgoing command is retained; inspect the connection before retrying.'})+'\n');}};
  socket.on('data',data=>{buffer+=data;if(Buffer.byteLength(buffer)>1024*1024){socket.destroy();return;}let n;while((n=buffer.indexOf('\n'))>=0){const line=buffer.slice(0,n);buffer=buffer.slice(n+1);handle(line);}});
  socket.on('error',()=>{});socket.on('close',()=>peers.delete(socket));
 });
 const sock=folder+'/run.sock';try{fs.unlinkSync(sock);}catch{}
-server.listen(sock,()=>{if(manager){fs.writeFileSync(folder+'/manager-provider',runtime.provider,{mode:0o600});emit('settings',{...runtime,applied:true});}fs.chmodSync(sock,0o600);fs.writeFileSync(folder+'/daemon.pid',String(process.pid),{mode:0o600});fs.writeFileSync(folder+'/bridge-protocol.json',JSON.stringify({version:2,pid:process.pid}),{mode:0o600});if(resume||manager&&runtime.provider==='codex'||!manager&&existing&&fs.existsSync(folder+'/has-session'))start();else state('idle');if(manager&&queue.length)start();});
-function quit(){memoryClock?.stop();checkinClock?.stop();codexWorkers?.stop();reminderClock?.stop();shuttingDown=true;restarting=false;cancelPermissions();server.close();if(!cli){process.exit(0);return;}cli.once('exit',()=>process.exit(0));cli.kill('SIGTERM');setTimeout(()=>process.exit(0),6500);}process.on('SIGTERM',quit);process.on('SIGINT',quit);
+server.listen(sock,()=>{if(manager){fs.writeFileSync(folder+'/manager-provider',runtime.provider,{mode:0o600});emit('settings',{...runtime,applied:true});}fs.chmodSync(sock,0o600);fs.writeFileSync(folder+'/daemon.pid',String(process.pid),{mode:0o600});fs.writeFileSync(folder+'/bridge-protocol.json',JSON.stringify({version:2,pid:process.pid,revision:bridgeRevision}),{mode:0o600});if(resume||manager&&runtime.provider==='codex'||!manager&&existing&&(fs.existsSync(folder+'/has-session')||queue.length))start();else state('idle');if(manager&&queue.length)start();});
+function quit(){if(shuttingDown)return;memoryClock?.stop();checkinClock?.stop();codexWorkers?.stop();reminderClock?.stop();shuttingDown=true;restarting=false;cancelPermissions();server.close();const finish=()=>journal.flush().then(()=>process.exit(0),()=>process.exit(1));if(!cli){finish();return;}cli.once('exit',finish);cli.kill('SIGTERM');setTimeout(finish,6500).unref();}process.on('SIGTERM',quit);process.on('SIGINT',quit);
 
 if(process.env.HERDR_SUPER_AGENT==='1')supervise(folder,events=>{
  const c={action:'send',request_id:'observe_'+crypto.createHash('sha256').update(JSON.stringify(events)).digest('hex').slice(0,40),text:'[Session events]\n'+JSON.stringify(events),images:[]};

@@ -42,7 +42,7 @@ else {emit({method:'item/agentMessage/delta',params:{threadId:'goal-thread',item
    assert(!all.some(e=>e.type==='delta'&&e.text.includes('目标已自动接续')),'background work without a publish decision stays silent');assert(all.some(e=>e.type==='followup_plan'&&e.publish===false));
    child.kill('SIGTERM');await new Promise(r=>child.once('exit',r));child=null;
   }
-  const dispatches=fs.readFileSync(home+'/data/forge-chat/qa-worker/dispatches.jsonl','utf8').trim().split('\n').map(JSON.parse);assert.equal(dispatches.length,1);assert(dispatches[0].text.includes('不生产发布、不批准工具'));
+  const dispatches=fs.readFileSync(home+'/data/forge-chat/qa-worker/dispatches.jsonl','utf8').trim().split('\n').map(JSON.parse);assert.equal(dispatches.length,1);assert(dispatches[0].text.includes(human.text));assert(!dispatches[0].text.includes('此消息不能代替'));assert(!dispatches[0].text.includes('既有授权范围'));assert(!dispatches[0].text.includes('不生产发布、不批准工具'));
   const goals=JSON.parse(fs.readFileSync(home+'/data/super-agent/goals.json'));assert.deepEqual(goals.goals[0].mandate.actions,['test']);assert.equal(goals.goals[0].human_accepted,false);assert(goals.goals[0].steps_receipts[0].confirmed);
  }finally{if(child){child.kill('SIGTERM');await new Promise(r=>child.once('exit',r));}fs.rmSync(root,{recursive:true,force:true});}
 });

@@ -218,6 +218,10 @@ and estimated session cost. Details include token counts, cache reads, duration
 and changed lines. Missing metrics stay unknown. These are native Claude CLI
 status-line facts; estimated cost is not an additional Pro subscription charge.
 
+日志持久化：执行服务在独立线程合并写入并刷盘，只有可靠保存后才发布接收回执、确认工具许可或发送输入；慢盘不会阻塞连接与心跳。Saving message 表示尚在保存，不代表 Claude 已接收。写入失败会暂停新投递并保留本地待发送队列。客户端在工作会话真正空闲、没有未确认消息或后台任务后才自动切换到新版服务。恢复仅处理有接收记录且未提交的输入，不重放历史导入、已提交或投递不明的消息。
+
+启动与进度：同一会话的服务在读取日志前持有操作系统独占锁，慢启动也不能产生多个写入进程。Claude 的控制回执最多等待 60 秒以容忍慢磁盘；服务重启后，只恢复日志能证明从未提交的排队输入，已提交、投递不明或被停止的输入不自动重发。Codex 确认接收后显示思考阶段；本轮超过两分钟无新进展时仅提示一次，后台例行检查保持静默。
+
 Native Claude chat supports pasting screenshots or copied PNG/JPEG/TIFF/BMP files into the editor. Click thumbnails for a full preview or × to remove a draft attachment. Sent images use bounded, aspect-preserving previews above the message text; multiple images wrap in narrow windows. A message can contain up to four images (8 MB per normalized PNG, source at most 64 MB and 8192×8192). Images upload over SSH into that conversation’s private image directory before sending. Image-only messages work. Attachments persist with drafts/outbox across restarts; failed uploads keep the queued message for retry. Offline queued messages are explicitly shown as not delivered. Upload deadlines cover writing the image payload as well as waiting for the receiver; a stalled connection retains the original queued request. Remote acceptance is not Claude input confirmation: unconfirmed turns queue subsequent input rather than offering steering, and delayed confirmation is shown explicitly. The SSH client adapts older services without restarting their Claude process. `chat.status` includes `draft_images` and `image_preview_open` for diagnosis.
 
 Super Agent is fixed above the Agents list. `supervisor.open` opens its single persistent native local Claude chat. `supervisor.list` discovers local/remote and manually created sessions without marking them read. `supervisor.read {address,offset?,limit?}` reads native messages without changing focus; `supervisor.send {address,text,request_id,mode?}` defaults to queuing follow-ups behind current native work without touching drafts. `supervisor.create {host?,folder,agent,title,request_id}` creates a worker without selecting it (Claude: a host already used by a session, an explicit SSH config alias (including Include files), or `@local`; Codex: existing core machine or `@local`). Manager tool calls use durable request receipts; uncertain delivery requires inspection, not automatic resend. The manager's task ledger keeps pending reviews separate from worker idle and connectivity.
@@ -316,6 +320,8 @@ a generated atomic `goals.json` projection for the right sidebar's 目标 tab.
 It shows the three highest-priority goals first; 其余目标 expands the remainder.
 Cards show current progress/next action and expandable mandate/exclusions.
 The decision inbox and archived human answers remain separate.
+
+Super Agent 派工保留已核实的用户原话（后续更正优先），将必要的管家补充和交付结果分开列出。任务表中的范围、限制不再作为固定声明附到派工；未明确给出的额外限制可留空。管家不得自行增加禁止执行方式或审批前置条件；实际工具权限和仓库规则仍由执行会话按真实情况处理。
 
 Management tools: list_goals reads goals and reconciled receipts; record_goal
 links legacy task IDs to a stable goal and stores its outcome, cited HUMAN
@@ -446,3 +452,10 @@ blocked, paused, completed and disconnected cases are excluded; unknown delivery
 is not replayed. Replies feed the existing goal-progress/continuation workflow.
 
 目标卡片的“删除目标”需要再次确认，可取消。删除后停止该目标的后续跟进与派发，保留会话、历史、审计及已发送回执；已派发的工作不会被终止。旧后台更新不能恢复已删除的目标。
+
+
+Super Agent 工具查询：列表默认每页 8 条、最多 25 条，支持 query、offset、limit；返回 total、next_offset、result_id 和明确的摘要/截断标记。list_decisions 默认仅 pending/answered；历史用 status=all 并优先搜索。list_sessions 每次只读一个 collection，任务、目标、派工、机器和关闭会话按需分别查询。inspect_sessions 先选一页再读取，分页是实时视图；不要把一页当全量验收。
+
+read_tool_result 用 result_id 和 JSON pointer path（例如 /decisions/0/context）分页、搜索准确字段，不会再次执行原工具。列表/对象最多每页 25 项，文本最多 2000 字符；所有工具正文最多 12 KB，写入回执最多 4 KB。摘要不替代完整授权、问题或结果；缓存证据保留源时间，不代表新鲜运行状态。read_session 支持分页搜索，每次最多扫描 120 条可用消息，partial 仍不代表完整原始 transcript。
+
+结果快照仅保存在本机 data/super-agent/tool-results，脱敏、私有权限，6 小时过期、最多 128 份或 64 MB（单份最多 16 MB）。过期后重新查询源记录，不要为了取回回执重复派工、审批或发布。记忆整理要分页读完当前记忆和 pending_human_feedback，并按需读取原文后再归纳。
